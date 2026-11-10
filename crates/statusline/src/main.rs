@@ -4,7 +4,7 @@ use statusline::context::capture_context;
 use statusline::gh;
 use statusline::git::current_branch;
 use statusline::limits::capture_rate_limits;
-use statusline::render::{RenderInputs, render};
+use statusline::render::{RenderInputs, RenderOptions, render};
 use statusline::settings::resolve_auto_compact_window;
 use statusline::state::{bump_session_state, default_state_dir, read_session_state};
 use statusline::types::{HookPayload, StatusPayload};
@@ -81,11 +81,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
 
-    let hidden = args
-        .windows(2)
-        .filter(|pair| pair[0] == "--hide")
-        .flat_map(|pair| pair[1].split(',').map(|s| s.trim().to_string()))
-        .collect();
+    let options = RenderOptions {
+        hidden: flag(&args, "--hide")
+            .map(|names| names.split(',').map(|s| s.trim().to_string()).collect())
+            .unwrap_or_default(),
+        user: std::env::var("USER").ok(),
+        linear_workspace: flag(&args, "--linear-workspace").map(String::from),
+    };
 
     let inputs = RenderInputs {
         now_ms,
@@ -93,7 +95,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         branch,
         auto_compact_window,
         gh,
-        hidden,
+        options,
     };
     println!("{}", render(&payload, &inputs, columns));
 
@@ -113,6 +115,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         now_ms,
     );
     Ok(())
+}
+
+/// The value after `name`: `--hide cache,api` gives `cache,api`.
+fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    args.windows(2)
+        .find(|pair| pair[0] == name)
+        .map(|pair| pair[1].as_str())
 }
 
 fn now_ms() -> i64 {

@@ -3410,7 +3410,7 @@ pub(crate) fn preview_samples(now: i64) -> (Vec<OpenSession>, Vec<MeterSlot>) {
             limit_tokens: None,
             captured_at_ms: now,
         }),
-        linear: crate::linear::ticket_id(branch).map(|id| crate::linear::LinearInfo {
+        linear: sl_core::branch::ticket_id(branch).map(|id| crate::linear::LinearInfo {
             url: format!("https://linear.app/x/issue/{id}"),
             state: ["In Progress", "In Review", "Todo"][id.len() % 3].into(),
             id,

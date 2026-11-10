@@ -1,9 +1,10 @@
 //! Shared by the status line and the tray: payload types, formatting,
-//! ANSI, paths, and the `gh`/`git` lookups.
+//! ANSI, paths, branch labels, and the `gh`/`git` lookups.
 
 #![forbid(unsafe_code)]
 
 pub mod ansi;
+pub mod branch;
 pub mod format;
 pub mod gh;
 pub mod git;

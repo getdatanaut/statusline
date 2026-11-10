@@ -686,7 +686,7 @@ pub fn network_asks(
                 .iter()
                 .filter_map(|s| {
                     Some((
-                        crate::linear::ticket_id(s.branch.as_deref()?)?,
+                        sl_core::branch::ticket_id(s.branch.as_deref()?)?,
                         s.cwd.clone(),
                     ))
                 })
@@ -787,7 +787,7 @@ pub fn apply_arrival(
             cache.retain(
                 &sessions
                     .iter()
-                    .filter_map(|s| crate::linear::ticket_id(s.branch.as_deref()?))
+                    .filter_map(|s| sl_core::branch::ticket_id(s.branch.as_deref()?))
                     .collect(),
             );
         }
