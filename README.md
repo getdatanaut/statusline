@@ -101,6 +101,9 @@ cargo install --path crates/statusline   # -> ~/.cargo/bin/statusline
 ```
 
 Both commands need an absolute path (`~` is not expanded).
+To drop segments, pass their names to `--hide`, e.g.
+`statusline --hide cache,api,tools,lines`. Names: `session`, `weekly`,
+`context`, `cache`, `cost`, `model`, `tools`, `api`, `lines`, `branch`.
 `refreshInterval` re-renders every 30s so reset countdowns stay current while
 idle. The hook is optional — without it the tools segment simply doesn't
 render. After changing the source, re-run `cargo install --path crates/statusline`
