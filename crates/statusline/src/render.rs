@@ -19,6 +19,15 @@ pub struct RenderInputs {
     pub branch: Option<String>,
     pub auto_compact_window: Option<i64>,
     pub gh: Option<GhInfo>,
+    /// Segment names from `--hide`: session, weekly, context, cache, cost,
+    /// model, tools, api, lines, branch.
+    pub hidden: Vec<String>,
+}
+
+impl RenderInputs {
+    fn shows(&self, segment: &str) -> bool {
+        !self.hidden.iter().any(|h| h == segment)
+    }
 }
 
 fn separator() -> String {
@@ -135,46 +144,64 @@ pub fn render_segments(payload: &StatusPayload, inputs: &RenderInputs) -> Vec<St
     let mut parts = Vec::new();
 
     let rate_limits = payload.rate_limits.as_ref();
-    if let Some(session) = rate_limit_segment("Session", rate_limits.and_then(|r| r.five_hour.as_ref()), inputs.now_ms) {
+    if inputs.shows("session")
+        && let Some(session) = rate_limit_segment("Session", rate_limits.and_then(|r| r.five_hour.as_ref()), inputs.now_ms)
+    {
         parts.push(session);
     }
-    if let Some(weekly) = rate_limit_segment("Weekly", rate_limits.and_then(|r| r.seven_day.as_ref()), inputs.now_ms) {
+    if inputs.shows("weekly")
+        && let Some(weekly) = rate_limit_segment("Weekly", rate_limits.and_then(|r| r.seven_day.as_ref()), inputs.now_ms)
+    {
         parts.push(weekly);
     }
 
-    if let Some(context) = context_segment(payload, inputs.auto_compact_window) {
+    if inputs.shows("context")
+        && let Some(context) = context_segment(payload, inputs.auto_compact_window)
+    {
         parts.push(context);
     }
 
-    if let Some(cache) = cache_segment(payload) {
+    if inputs.shows("cache")
+        && let Some(cache) = cache_segment(payload)
+    {
         parts.push(cache);
     }
 
-    if let Some(cost) = payload.cost.as_ref().and_then(|c| c.total_cost_usd) {
+    if inputs.shows("cost")
+        && let Some(cost) = payload.cost.as_ref().and_then(|c| c.total_cost_usd)
+    {
         parts.push(colored(&sl_core::format::money(cost), WHITE));
     }
 
-    if let Some(model) = model_name(payload) {
+    if inputs.shows("model")
+        && let Some(model) = model_name(payload)
+    {
         parts.push(format!("{}{}", colored(&model, WHITE), effort_marker(payload)));
     }
 
-    if let Some(tools) = tools_segment(inputs.session_state.as_ref(), inputs.now_ms) {
+    if inputs.shows("tools")
+        && let Some(tools) = tools_segment(inputs.session_state.as_ref(), inputs.now_ms)
+    {
         parts.push(tools);
     }
 
-    if let Some(api) = api_share_segment(payload) {
+    if inputs.shows("api")
+        && let Some(api) = api_share_segment(payload)
+    {
         parts.push(api);
     }
 
     let added = payload.cost.as_ref().and_then(|c| c.total_lines_added).unwrap_or(0);
     let removed = payload.cost.as_ref().and_then(|c| c.total_lines_removed).unwrap_or(0);
-    if added > 0 || removed > 0 {
+    if inputs.shows("lines") && (added > 0 || removed > 0) {
         parts.push(format!("{} {}", colored(&format!("+{added}"), BRIGHT_GREEN), colored(&format!("-{removed}"), BRIGHT_RED)));
     }
 
     // With a target the branch leads the GitHub rows instead, so it is not
     // said twice; otherwise it carries its PR number and review state.
-    if let Some(branch) = inputs.branch.as_ref().filter(|_| target(inputs).is_none()) {
+    if inputs.shows("branch")
+        && let Some(branch) = inputs.branch.as_ref().filter(|_| target(inputs).is_none())
+    {
         let pr = inputs.gh.as_ref().and_then(|g| g.pr_number).map(|n| format!(" {}{}", pr_number(n), review_marker(payload)));
         parts.push(format!("{}{}", colored(branch, CYAN), pr.unwrap_or_default()));
     }

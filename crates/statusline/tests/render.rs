@@ -40,6 +40,7 @@ fn base_inputs() -> RenderInputs {
         branch: Some("main".to_string()),
         auto_compact_window: None,
         gh: None,
+        hidden: Vec::new(),
     }
 }
 
@@ -53,6 +54,16 @@ fn full_line_with_all_segments() {
         plain(&base_payload(), &base_inputs()),
         "Session ⣄⣀⣀⣀⣀⣀ 3% 4h 46m | Weekly ⣿⣿⣶⣀⣀⣀ 45% 13h 26m | \
          Context ⣤⣀⣀⣀⣀⣀ 46.1k/1M | $1.85 | Fable 5 | [|] 12 tools 5m | +4 -1 | main"
+    );
+}
+
+#[test]
+fn hidden_segments_are_left_out() {
+    let mut inputs = base_inputs();
+    inputs.hidden = vec!["session".into(), "tools".into(), "lines".into()];
+    assert_eq!(
+        plain(&base_payload(), &inputs),
+        "Weekly ⣿⣿⣶⣀⣀⣀ 45% 13h 26m | Context ⣤⣀⣀⣀⣀⣀ 46.1k/1M | $1.85 | Fable 5 | main"
     );
 }
 
@@ -106,6 +117,7 @@ fn missing_pieces_drop_their_segments_instead_of_crashing() {
         branch: None,
         auto_compact_window: None,
         gh: None,
+        hidden: Vec::new(),
     };
     assert_eq!(plain(&parse("{}"), &empty_inputs), "");
 
