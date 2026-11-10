@@ -1,0 +1,130 @@
+[package]
+name = "sl-macos"
+version = "0.1.0"
+edition.workspace = true
+description = "The workspace's only FFI boundary: safe wrappers over the AppKit and libc calls the tray makes."
+
+[dependencies]
+block2 = "0.6"
+libc = "0.2"
+objc2 = "0.6.4"
+# Native notifications (the tray embeds the Info.plist that gives them a sender).
+objc2-user-notifications = "0.3"
+
+[dependencies.objc2-foundation]
+version = "0.3.2"
+default-features = false
+features = [
+    # `+[NSTimer timerWithTimeInterval:repeats:block:]`.
+    "block2",
+    "NSArray",
+    "NSAttributedString",
+    "NSData",
+    "NSDate",
+    "NSDictionary",
+    "NSGeometry",
+    "NSObject",
+    "NSRunLoop",
+    "NSString",
+    "NSThread",
+    "NSTimer",
+    # Clickable links in the review popup.
+    "NSURL",
+    # The Stats window's range and session tab, kept across launches.
+    "NSUserDefaults",
+    # `NSNumber`, for the captions' letter spacing.
+    "NSValue",
+    "NSRange",
+]
+
+# `NSAttributedString` is enabled here as well as on objc2-foundation: the
+# class itself lives in Foundation, but the attribute-key statics we need
+# (`NSFontAttributeName`, `NSForegroundColorAttributeName`) are AppKit's and
+# are gated behind AppKit's own `NSAttributedString` feature.
+[dependencies.objc2-app-kit]
+version = "0.3.2"
+default-features = false
+features = [
+    "NSAlert",
+    # The menu bar's light or dark appearance, for the icon.
+    "NSAppearance",
+    "NSApplication",
+    "NSAttributedString",
+    # `--stats-preview`'s render of the Stats window.
+    "NSBitmapImageRep",
+    "NSImageRep",
+    # The usage meters' tracks and the menu bar glyph.
+    "NSBezierPath",
+    "NSButton",
+    # `NSBezelStyle`, for the footer's Quit button.
+    "NSButtonCell",
+    "NSCell",
+    "NSColor",
+    # `NSColorName`, for the dynamic dim-text colour.
+    "NSColorList",
+    "NSControl",
+    "NSFont",
+    # Drawing the chevrons onto equal canvases.
+    "NSGraphics",
+    "block2",
+    "NSFontDescriptor",
+    # The menu bar icon: `NSImage::imageWithSystemSymbolName_...` plus
+    # `setTemplate(true)`, so AppKit recolours the SF Symbol for a light or
+    # dark menu bar instead of the app picking a colour that is wrong half the
+    # time.
+    "NSImage",
+    # The submenu header's PR icon.
+    "NSImageView",
+    "NSMenu",
+    "NSMenuItem",
+    # Copy-to-clipboard on an open-session row.
+    "NSPasteboard",
+    # The Compact layout: a popover of session cards.
+    "NSPopover",
+    "NSViewController",
+    "NSResponder",
+    "NSRunningApplication",
+    # The review / log popups: an alert whose accessory view is a scrolling,
+    # read-only text view.
+    "NSScrollView",
+    # The Closed Sessions window's filter.
+    "NSSearchField",
+    # The tray's fixed width, from the screen's.
+    "NSScreen",
+    "NSText",
+    "NSTextView",
+    "NSTextAttachment",
+    "NSTextContainer",
+    "NSTextStorage",
+    "NSStatusBar",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "NSTextField",
+    "NSView",
+    # The Stats window: a toolbar with a segmented control over a scrolling,
+    # drawn view that tracks the pointer for the chart's readout.
+    "NSClipView",
+    # The pointing hand over a Compact card.
+    "NSCursor",
+    "NSEvent",
+    "NSGraphicsContext",
+    "NSParagraphStyle",
+    "NSSegmentedControl",
+    # The Settings window's tabs.
+    "NSTabView",
+    "NSTabViewItem",
+    "NSShadow",
+    "NSStringDrawing",
+    "NSToolbar",
+    "NSToolbarItem",
+    "NSTrackingArea",
+    "NSWindow",
+    "objc2-core-foundation",
+]
+
+[[test]]
+name = "appkit"
+harness = false
+
+[lints]
+workspace = true
