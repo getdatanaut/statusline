@@ -316,7 +316,6 @@ pub fn ago(ms: i64) -> String {
 }
 
 #[cfg(test)]
-#[expect(clippy::float_cmp, reason = "each comparison is of a value exact by construction: a whole number or a half")]
 mod tests {
     use super::*;
     use crate::snapshot::{DayModel, LatestSession, ModelUsage};

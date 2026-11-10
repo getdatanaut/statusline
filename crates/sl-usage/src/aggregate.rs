@@ -373,7 +373,6 @@ pub fn block_burn_rate(block: &SessionBlock) -> Option<BlockBurnRate> {
 }
 
 #[cfg(test)]
-#[expect(clippy::float_cmp, reason = "each comparison is of a value exact by construction: zero, a small binary fraction, or the same expression on both sides")]
 mod tests {
     use super::*;
 

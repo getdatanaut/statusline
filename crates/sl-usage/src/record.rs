@@ -395,7 +395,6 @@ fn consume_ascii_digits(bytes: &[u8], index: &mut usize) -> bool {
 }
 
 #[cfg(test)]
-#[expect(clippy::float_cmp, reason = "each comparison is of a value exact by construction: zero, a small binary fraction, or the same expression on both sides")]
 mod tests {
     use super::*;
 
