@@ -1,0 +1,11 @@
+# IntelliJ based IDEs
+.idea
+
+# Finder (MacOS) folder config
+.DS_Store
+
+# Added by cargo
+/target
+
+# Coverage profiles; instrumented runs write them into their working directory
+*.profraw
