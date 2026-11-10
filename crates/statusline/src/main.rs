@@ -72,7 +72,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
 
-    let inputs = RenderInputs { now_ms, session_state, branch, auto_compact_window, gh };
+    let hidden = args
+        .windows(2)
+        .filter(|pair| pair[0] == "--hide")
+        .flat_map(|pair| pair[1].split(',').map(|s| s.trim().to_string()))
+        .collect();
+
+    let inputs = RenderInputs { now_ms, session_state, branch, auto_compact_window, gh, hidden };
     println!("{}", render(&payload, &inputs, columns));
 
     // Last, and after the line has been printed: the tray's rate-limit capture
