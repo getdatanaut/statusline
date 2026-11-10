@@ -1,0 +1,152 @@
+[package]
+name = "sl-tray"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "statusline-tray"
+path = "src/main.rs"
+
+[dependencies]
+block2 = "0.6"
+# Calendar arithmetic that `sl-usage` does not already expose: the previous
+# calendar day/week for the day-over-day and week-over-week deltas, and
+# days-in-month for the monthly projection. The alternative is hand-rolled
+# leap-year and month-length arithmetic sitting next to `sl-usage`'s correct
+# version of the same thing.
+chrono = "0.4"
+dirs = "6.0.0"
+objc2 = "0.6.4"
+sl-core = { path = "../sl-core" }
+sl-macos = { path = "../sl-macos" }
+sl-usage = { path = "../sl-usage" }
+
+# The snapshot as JSON: `--dump-snapshot` prints it, `--stats-preview` reads
+# it back; and the remembered closed sessions are stored as JSON.
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+pulldown-cmark = { version = "0.13", default-features = false }
+
+# Both framework crates default to enabling ~700 features (essentially all of
+# Foundation/AppKit), which is a large, pointless compile-time cost for a menu
+# bar app that touches a dozen classes. Enable only what is actually used.
+[dependencies.objc2-foundation]
+version = "0.3.2"
+default-features = false
+features = [
+    "NSArray",
+    "NSAttributedString",
+    "NSData",
+    "NSDate",
+    "NSDictionary",
+    "NSGeometry",
+    "NSObject",
+    "NSRunLoop",
+    "NSString",
+    "NSThread",
+    "NSTimer",
+    # Clickable links in the review popup.
+    "NSURL",
+    # The Stats window's range and session tab, kept across launches.
+    "NSUserDefaults",
+    # `NSNumber`, for the captions' letter spacing.
+    "NSValue",
+    "NSRange",
+]
+
+# `NSAttributedString` is enabled here as well as on objc2-foundation: the
+# class itself lives in Foundation, but the attribute-key statics we need
+# (`NSFontAttributeName`, `NSForegroundColorAttributeName`) are AppKit's and
+# are gated behind AppKit's own `NSAttributedString` feature.
+[dependencies.objc2-app-kit]
+version = "0.3.2"
+default-features = false
+features = [
+    "NSAlert",
+    # The menu bar's light or dark appearance, for the icon.
+    "NSAppearance",
+    "NSApplication",
+    "NSAttributedString",
+    # `--stats-preview`'s render of the Stats window.
+    "NSBitmapImageRep",
+    "NSImageRep",
+    # The usage meters' tracks and the menu bar glyph.
+    "NSBezierPath",
+    "NSButton",
+    # `NSBezelStyle`, for the footer's Quit button.
+    "NSButtonCell",
+    "NSCell",
+    "NSColor",
+    # `NSColorName`, for the dynamic dim-text colour.
+    "NSColorList",
+    "NSControl",
+    "NSFont",
+    # Drawing the chevrons onto equal canvases.
+    "NSGraphics",
+    "block2",
+    "NSFontDescriptor",
+    # The menu bar icon: `NSImage::imageWithSystemSymbolName_...` plus
+    # `setTemplate(true)`, so AppKit recolours the SF Symbol for a light or
+    # dark menu bar instead of the app picking a colour that is wrong half the
+    # time.
+    "NSImage",
+    # The submenu header's PR icon.
+    "NSImageView",
+    "NSMenu",
+    "NSMenuItem",
+    # Copy-to-clipboard on an open-session row.
+    "NSPasteboard",
+    # The Compact layout: a popover of session cards.
+    "NSPopover",
+    "NSViewController",
+    "NSResponder",
+    "NSRunningApplication",
+    # The review / log popups: an alert whose accessory view is a scrolling,
+    # read-only text view.
+    "NSScrollView",
+    # The Closed Sessions window's filter.
+    "NSSearchField",
+    # The tray's fixed width, from the screen's.
+    "NSScreen",
+    "NSText",
+    "NSTextView",
+    "NSTextAttachment",
+    "NSTextContainer",
+    "NSTextStorage",
+    "NSStatusBar",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "NSTextField",
+    "NSView",
+    # The Stats window: a toolbar with a segmented control over a scrolling,
+    # drawn view that tracks the pointer for the chart's readout.
+    "NSClipView",
+    # The pointing hand over a Compact card.
+    "NSCursor",
+    "NSEvent",
+    "NSGraphicsContext",
+    "NSParagraphStyle",
+    "NSSegmentedControl",
+    # The Settings window's tabs.
+    "NSTabView",
+    "NSTabViewItem",
+    "NSShadow",
+    "NSStringDrawing",
+    "NSToolbar",
+    "NSToolbarItem",
+    "NSTrackingArea",
+    "NSWindow",
+    "objc2-core-foundation",
+]
+
+# The snapshot fixtures need to synthesise timestamps and JSONL lines; `chrono`
+# is a plain dependency above, so there is nothing test-only left to declare.
+# (Day and week *bucketing* still comes from `sl-usage`'s `local_date` /
+# `monday_of_week`, never reimplemented here -- chrono is only used for
+# arithmetic `sl-usage` has no equivalent of.)
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3"

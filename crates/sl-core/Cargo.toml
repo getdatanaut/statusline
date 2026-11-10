@@ -1,0 +1,18 @@
+[package]
+name = "sl-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dirs = "6.0.0"
+owo-colors = "4.3.0"
+serde = { version = "1.0.228", features = ["derive"] }
+# `RateLimitScope::surface` only: its shape is unspecified, so it is carried as
+# raw JSON rather than guessed at.
+serde_json = "1.0.150"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3"
