@@ -736,7 +736,6 @@ fn normalized_pricing_key(value: &str) -> std::borrow::Cow<'_, str> {
 }
 
 #[cfg(test)]
-#[expect(clippy::float_cmp, reason = "each comparison is of a value exact by construction: zero, a small binary fraction, or the same expression on both sides")]
 mod tests {
     use super::*;
 

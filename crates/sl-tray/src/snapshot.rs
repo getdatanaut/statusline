@@ -841,7 +841,6 @@ pub fn now_ms() -> i64 {
 }
 
 #[cfg(test)]
-#[expect(clippy::float_cmp, reason = "each comparison is of a value exact by construction: a whole number or a half")]
 mod tests {
     use std::fmt::Write as _;
     use super::*;

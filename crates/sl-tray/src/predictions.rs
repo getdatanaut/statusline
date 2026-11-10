@@ -180,7 +180,6 @@ pub fn window_pace(used_percent: f64, window_ms: i64, resets_at_ms: i64, now_ms:
 }
 
 #[cfg(test)]
-#[expect(clippy::float_cmp, reason = "each comparison is of a value exact by construction: a whole number or a half")]
 mod tests {
     use super::*;
 

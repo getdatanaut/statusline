@@ -89,7 +89,6 @@ fn write_capture(cache_dir: &Path, rate_limits: &Value, now_ms: i64) {
 }
 
 #[cfg(test)]
-#[expect(clippy::float_cmp, reason = "the percentages compared are the exact values written")]
 mod tests {
     use super::*;
     use std::fs;
