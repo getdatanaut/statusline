@@ -188,6 +188,11 @@ pub struct GhInfo {
     /// `OPEN`, `MERGED` or `CLOSED`; absent in entries written before it was kept.
     #[serde(default)]
     pub state: Option<String>,
+    /// Until when the one who fetched this asks no one to fetch it again: the
+    /// tray's polling interval, which a status line render then honours
+    /// instead of its own 30 s. 0 in entries that do not carry one.
+    #[serde(default)]
+    pub fresh_until_ms: i64,
     /// Set by a reader, never stored: this "no PR" answer is old enough that
     /// the PR may exist by now, and has not been asked about again yet.
     #[serde(skip)]
@@ -198,6 +203,22 @@ impl GhInfo {
     /// A merged or closed PR does not change again.
     pub fn is_final(&self) -> bool {
         self.pr_number.is_some() && matches!(self.state.as_deref(), Some("MERGED" | "CLOSED"))
+    }
+
+    /// Whether a render should have this branch asked about again: when the
+    /// entry predates the current schema, or has outlived the longer of the
+    /// status line's own interval and the one its fetcher vouched for. A
+    /// merged or closed PR is trusted for the recheck interval instead.
+    pub fn is_stale(&self, now_ms: i64) -> bool {
+        if self.schema != SCHEMA {
+            return true;
+        }
+        let fresh_until = if self.is_final() {
+            self.fetched_ms + FINAL_RECHECK_MS
+        } else {
+            (self.fetched_ms + STALE_AFTER_MS).max(self.fresh_until_ms)
+        };
+        now_ms >= fresh_until
     }
 }
 
@@ -246,16 +267,16 @@ pub fn load_and_refresh(cache_dir: &Path, dir: &str, branch: &str, now_ms: i64) 
     }
     let key = cache_key(dir, branch);
     let cached: Option<GhInfo> = crate::paths::read_json(&cache_path(cache_dir, &key));
-    let stale = cached
-        .as_ref()
-        .is_none_or(|c| c.schema != SCHEMA || now_ms - c.fetched_ms >= STALE_AFTER_MS);
-    if stale {
+    if cached.as_ref().is_none_or(|c| c.is_stale(now_ms)) {
         spawn_refresh(cache_dir, &key, dir, branch);
     }
     cached
 }
 
-fn spawn_refresh(cache_dir: &Path, key: &str, dir: &str, branch: &str) {
+/// Claim the right to run `gh` for this branch: false while someone else's
+/// claim is younger than [`LOCK_FOR`]. One claim per branch, whoever asks (a
+/// render's detached refresh or the tray), so the two never fetch at once.
+fn try_lock(cache_dir: &Path, key: &str) -> bool {
     let lock = lock_path(cache_dir, key);
     let recent = fs::metadata(&lock)
         .and_then(|m| m.modified())
@@ -263,10 +284,19 @@ fn spawn_refresh(cache_dir: &Path, key: &str, dir: &str, branch: &str) {
         .and_then(|t| SystemTime::now().duration_since(t).ok())
         .is_some_and(|age| age < LOCK_FOR);
     if recent {
-        return;
+        return false;
     }
     fs::create_dir_all(cache_dir).ok();
-    if fs::write(&lock, b"").is_err() {
+    fs::write(&lock, b"").is_ok()
+}
+
+/// Give the claim back once the answer is stored: a fresh entry needs no lock.
+fn unlock(cache_dir: &Path, key: &str) {
+    fs::remove_file(lock_path(cache_dir, key)).ok();
+}
+
+fn spawn_refresh(cache_dir: &Path, key: &str, dir: &str, branch: &str) {
+    if !try_lock(cache_dir, key) {
         return;
     }
     let Ok(exe) = std::env::current_exe() else {
@@ -295,6 +325,7 @@ pub fn run_refresh(cache_dir: &Path, dir: &str, branch: &str, now_ms: i64) {
         std::process::exit(1);
     });
     store(cache_dir, dir, branch, &fetch(dir, now_ms));
+    unlock(cache_dir, &cache_key(dir, branch));
 }
 
 /// Whatever is cached for `branch` in `dir`, however old, without asking `gh`:
@@ -317,24 +348,46 @@ pub fn load_or_fetch(
     now_ms: i64,
     max_age_ms: impl Fn(&GhInfo) -> i64,
 ) -> Option<GhInfo> {
+    load_or_fetch_with(cache_dir, dir, branch, now_ms, max_age_ms, || {
+        fetch(dir, now_ms)
+    })
+}
+
+/// [`load_or_fetch`], asking `fetch_now` instead of `gh`. While another
+/// process holds the branch's claim the old entry is returned as it is, for
+/// that process to replace. A fresh answer carries `max_age_ms` as the time
+/// the status line may rely on it, so a render does not ask again meanwhile.
+fn load_or_fetch_with(
+    cache_dir: &Path,
+    dir: &str,
+    branch: &str,
+    now_ms: i64,
+    max_age_ms: impl Fn(&GhInfo) -> i64,
+    fetch_now: impl FnOnce() -> GhInfo,
+) -> Option<GhInfo> {
     if !worth_fetching(branch) {
         return None;
     }
     let key = cache_key(dir, branch);
     let cached: Option<GhInfo> = crate::paths::read_json(&cache_path(cache_dir, &key));
-    if let Some(cached) = cached
-        && cached.schema == SCHEMA
+    let cached = cached.filter(|c| c.schema == SCHEMA);
+    if let Some(cached) = &cached
         && now_ms - cached.fetched_ms
             < if cached.is_final() {
                 FINAL_RECHECK_MS
             } else {
-                max_age_ms(&cached)
+                max_age_ms(cached)
             }
     {
-        return Some(cached);
+        return Some(cached.clone());
     }
-    let info = fetch(dir, now_ms);
+    if !try_lock(cache_dir, &key) {
+        return cached;
+    }
+    let mut info = fetch_now();
+    info.fresh_until_ms = now_ms + max_age_ms(&info);
     store(cache_dir, dir, branch, &info);
+    unlock(cache_dir, &key);
     Some(info)
 }
 
@@ -701,6 +754,106 @@ mod tests {
             kept.pr_number,
             Some(7),
             "half an hour later it is still not asked again"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn entry(fetched_ms: i64, pr: Option<i64>, state: Option<&str>) -> GhInfo {
+        GhInfo {
+            fetched_ms,
+            schema: SCHEMA,
+            pr_number: pr,
+            state: state.map(String::from),
+            ..GhInfo::default()
+        }
+    }
+
+    #[test]
+    fn a_render_asks_again_after_thirty_seconds_unless_the_fetcher_vouched_for_longer() {
+        let open = entry(0, Some(1), Some("OPEN"));
+        assert!(!open.is_stale(29_999));
+        assert!(open.is_stale(30_000));
+        let vouched = GhInfo {
+            fresh_until_ms: 300_000,
+            ..open
+        };
+        assert!(
+            !vouched.is_stale(299_999),
+            "the tray polls every five minutes"
+        );
+        assert!(vouched.is_stale(300_000));
+        assert!(
+            GhInfo {
+                schema: SCHEMA - 1,
+                ..vouched
+            }
+            .is_stale(1),
+            "an entry from an older schema is always asked about"
+        );
+    }
+
+    #[test]
+    fn a_render_does_not_ask_again_about_a_merged_pr_within_the_hour() {
+        let merged = entry(0, Some(1), Some("MERGED"));
+        assert!(!merged.is_stale(FINAL_RECHECK_MS - 1));
+        assert!(merged.is_stale(FINAL_RECHECK_MS));
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sl-gh-{name}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        dir
+    }
+
+    #[test]
+    fn a_fetch_vouches_for_its_answer_and_gives_the_claim_back() {
+        let dir = scratch("vouch");
+        let got = load_or_fetch_with(
+            &dir,
+            "/d",
+            "b",
+            1_000,
+            |_| 60_000,
+            || entry(1_000, Some(2), Some("OPEN")),
+        )
+        .expect("fetched");
+        assert_eq!(got.fresh_until_ms, 61_000);
+        let stored = load_cached(&dir, "/d", "b").expect("stored");
+        assert_eq!(stored.fresh_until_ms, 61_000);
+        assert!(!stored.is_stale(60_999), "a render leaves it to the tray");
+        assert!(
+            !lock_path(&dir, &cache_key("/d", "b")).exists(),
+            "nothing is left claimed"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn while_another_process_is_fetching_the_old_entry_is_returned_and_gh_is_not_run() {
+        let dir = scratch("claimed");
+        store(&dir, "/d", "b", &entry(0, Some(2), Some("OPEN")));
+        assert!(
+            try_lock(&dir, &cache_key("/d", "b")),
+            "the other process's claim"
+        );
+        let asked = std::cell::Cell::new(false);
+        let got = load_or_fetch_with(
+            &dir,
+            "/d",
+            "b",
+            500_000,
+            |_| 60_000,
+            || {
+                asked.set(true);
+                entry(500_000, Some(2), Some("OPEN"))
+            },
+        )
+        .expect("the old entry");
+        assert!(!asked.get(), "another process is already asking");
+        assert_eq!(got.fetched_ms, 0);
+        assert!(
+            !try_lock(&dir, &cache_key("/d", "b")),
+            "its claim is untouched"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
