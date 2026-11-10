@@ -489,7 +489,7 @@ pub fn load(
     let open: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
     caches.retain(&open);
     if let Some(cache) = linear {
-        cache.retain(&sessions.iter().filter_map(|s| crate::linear::ticket_id(s.branch.as_deref()?)).collect());
+        cache.retain(&sessions.iter().filter_map(|s| sl_core::branch::ticket_id(s.branch.as_deref()?)).collect());
     }
     sort_sessions(&mut sessions);
     Some(sessions)

@@ -4,7 +4,7 @@ use statusline::gh;
 use statusline::git::current_branch;
 use statusline::context::capture_context;
 use statusline::limits::capture_rate_limits;
-use statusline::render::{render, RenderInputs};
+use statusline::render::{render, RenderInputs, RenderOptions};
 use statusline::settings::resolve_auto_compact_window;
 use statusline::state::{bump_session_state, default_state_dir, read_session_state};
 use statusline::types::{HookPayload, StatusPayload};
@@ -72,13 +72,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
 
-    let hidden = args
-        .windows(2)
-        .filter(|pair| pair[0] == "--hide")
-        .flat_map(|pair| pair[1].split(',').map(|s| s.trim().to_string()))
-        .collect();
+    let options = RenderOptions {
+        hidden: flag(&args, "--hide").map(|names| names.split(',').map(|s| s.trim().to_string()).collect()).unwrap_or_default(),
+        user: std::env::var("USER").ok(),
+        linear_workspace: flag(&args, "--linear-workspace").map(String::from),
+    };
 
-    let inputs = RenderInputs { now_ms, session_state, branch, auto_compact_window, gh, hidden };
+    let inputs = RenderInputs { now_ms, session_state, branch, auto_compact_window, gh, options };
     println!("{}", render(&payload, &inputs, columns));
 
     // Last, and after the line has been printed: the tray's rate-limit capture
@@ -92,6 +92,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // And each session's context use, for the ring on its row in the tray.
     capture_context(&sl_core::paths::cache_dir(), &payload, auto_compact_window, now_ms);
     Ok(())
+}
+
+/// The value after `name`: `--hide cache,api` gives `cache,api`.
+fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    args.windows(2).find(|pair| pair[0] == name).map(|pair| pair[1].as_str())
 }
 
 fn now_ms() -> i64 {

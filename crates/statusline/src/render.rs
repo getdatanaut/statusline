@@ -1,7 +1,7 @@
 use crate::ansi::visible_width;
 use crate::format::{
-    colored, dimmed, fmt_countdown, fmt_elapsed, fmt_tokens, make_bar, BRIGHT_GREEN, BRIGHT_RED, CYAN, GREEN, RED,
-    WHITE, YELLOW,
+    colored, dimmed, fmt_countdown, fmt_elapsed, fmt_tokens, link, make_bar, BRIGHT_GREEN, BRIGHT_RED, CYAN, GREEN,
+    RED, WHITE, YELLOW,
 };
 use crate::gh::{is_non_default_base, CiState, GhInfo, MAX_FAILED_ROWS};
 use crate::settings::effective_context_limit;
@@ -19,14 +19,50 @@ pub struct RenderInputs {
     pub branch: Option<String>,
     pub auto_compact_window: Option<i64>,
     pub gh: Option<GhInfo>,
+    pub options: RenderOptions,
+}
+
+/// What the user chose on the command line.
+#[derive(Clone, Default)]
+pub struct RenderOptions {
     /// Segment names from `--hide`: session, weekly, context, cache, cost,
     /// model, tools, api, lines, branch.
     pub hidden: Vec<String>,
+    /// `$USER`, whose `user/` branch prefix is left off.
+    pub user: Option<String>,
+    /// From `--linear-workspace`: the slug in `linear.app/<slug>/issue/…`
+    /// that ticket labels link to.
+    pub linear_workspace: Option<String>,
 }
 
 impl RenderInputs {
     fn shows(&self, segment: &str) -> bool {
-        !self.hidden.iter().any(|h| h == segment)
+        !self.options.hidden.iter().any(|h| h == segment)
+    }
+
+    /// The short branch, its ticket (`DN-544-discovery…`) linked to Linear.
+    fn branch_label(&self, branch: &str) -> String {
+        let label = sl_core::branch::label(branch, self.options.user.as_deref());
+        let ticket = label.ticket.map(|id| {
+            let text = colored(&id, CYAN);
+            match self.options.linear_workspace.as_deref() {
+                Some(workspace) => link(&text, &format!("https://linear.app/{workspace}/issue/{id}")),
+                None => text,
+            }
+        });
+        let piece = |text: &str| if text.is_empty() { String::new() } else { colored(text, CYAN) };
+        format!("{}{}{}", piece(&label.before), ticket.unwrap_or_default(), piece(&label.after))
+    }
+
+    /// `(#730)`, linked to the PR. Any PR number in the stack shares the head
+    /// PR's repository, so its url is the head PR's with the number swapped.
+    fn pr_number(&self, number: i64) -> String {
+        let text = colored(&format!("(#{number})"), CYAN);
+        let pulls = self.gh.as_ref().and_then(|g| g.url.as_deref()).and_then(|u| u.rsplit_once('/'));
+        match pulls {
+            Some((pulls, _)) => link(&text, &format!("{pulls}/{number}")),
+            None => text,
+        }
     }
 }
 
@@ -42,72 +78,77 @@ const WRAP_MARGIN: usize = 4;
 pub fn render(payload: &StatusPayload, inputs: &RenderInputs, width: Option<usize>) -> String {
     let width = width.map(|w| w.saturating_sub(WRAP_MARGIN).max(1));
     let mut lines = wrap_segments(&render_segments(payload, inputs), width);
-    lines.extend(gh_rows(inputs, &review_marker(payload), width));
+    if inputs.shows("branch") {
+        lines.extend(wrap_segments(&pr_segments(payload, inputs), width));
+        lines.extend(failed_job_rows(inputs));
+    }
     lines.join("\n")
 }
 
-/// The PR's target branch, when it targets something other than the default
-/// branch -- the only case that gets the two-row head/target layout.
+/// The branch the PR is stacked on, when it is not the default branch.
 fn target(inputs: &RenderInputs) -> Option<&str> {
     let gh = inputs.gh.as_ref()?;
     gh.pr_number?;
     gh.base.as_deref().filter(|b| is_non_default_base(b))
 }
 
-fn pr_number(number: i64) -> String {
-    colored(&format!("(#{number})"), CYAN)
-}
-
-/// The GitHub rows under the main line. For a PR that targets another branch:
+/// The branch's PR, on a row of its own under the main line:
 ///
 /// ```text
-/// head-branch (#730) ✓
-///   → base-branch (1adc44e1c5) (#729) | draft | ✓ CI passing
+/// marketing-site (#773) ✓ → DN-544 (#771) | draft | ✓ CI passing
 /// ```
 ///
-/// the head with its own PR, then the base with its tip commit and *its* PR
-/// (the parent in a stack). Then one row per failed job. Each is its own
-/// stdout line, so Claude Code shows it as its own status row.
-pub fn gh_rows(inputs: &RenderInputs, review: &str, width: Option<usize>) -> Vec<String> {
-    let Some(gh) = &inputs.gh else { return Vec::new() };
-    let mut head_row = None;
-    let mut parts = Vec::new();
-
-    if let Some(base) = target(inputs) {
-        if let (Some(branch), Some(number)) = (inputs.branch.as_deref(), gh.pr_number) {
-            head_row = Some(format!("{} {}{review}", colored(branch, CYAN), pr_number(number)));
-        }
-        let sha = gh.base_sha.as_deref().map(|s| format!(" {}", dimmed(&format!("({s})")))).unwrap_or_default();
-        let base_pr = gh.base_pr.map(|n| format!(" {}", pr_number(n))).unwrap_or_default();
-        parts.push(format!("  {} {}{sha}{base_pr}", dimmed("→"), colored(base, CYAN)));
-    }
+/// the PR with its review state, the branch it is stacked on with that
+/// branch's own PR, then the PR's draft and CI state. Empty without a PR: the
+/// branch then sits on the main line.
+pub fn pr_segments(payload: &StatusPayload, inputs: &RenderInputs) -> Vec<String> {
+    let (Some(gh), Some(branch)) = (&inputs.gh, inputs.branch.as_deref()) else { return Vec::new() };
+    let Some(number) = gh.pr_number else { return Vec::new() };
+    let stacked_on = target(inputs)
+        .map(|base| {
+            let base_pr = gh.base_pr.map(|n| format!(" {}", inputs.pr_number(n))).unwrap_or_default();
+            format!(" {} {}{base_pr}", dimmed("→"), inputs.branch_label(base))
+        })
+        .unwrap_or_default();
+    let mut parts = vec![format!("{} {}{}{stacked_on}", inputs.branch_label(branch), inputs.pr_number(number), review_marker(payload))];
 
     match gh.is_draft {
         Some(true) => parts.push(colored("draft", YELLOW)),
-        Some(false) if gh.pr_number.is_some() => parts.push(colored("ready", GREEN)),
-        _ => {}
+        Some(false) => parts.push(colored("ready", GREEN)),
+        None => {}
     }
 
-    let mut rows = Vec::new();
     if let Some(ci) = &gh.ci {
-        parts.push(match ci.state {
-            CiState::Passing => colored("✓ CI passing", BRIGHT_GREEN),
+        let text = match ci.state {
+            CiState::Passing => colored("✓ CI passing", GREEN),
             CiState::Pending => colored(&format!("● CI running ({} pending)", ci.pending), YELLOW),
             CiState::Failing => colored(&format!("✗ CI failed: {}", ci.failed.len()), BRIGHT_RED),
+        };
+        parts.push(match gh.url.as_deref() {
+            Some(url) => link(&text, &format!("{url}/checks")),
+            None => text,
         });
-        for job in ci.failed.iter().take(MAX_FAILED_ROWS) {
-            let link = job.link.as_deref().map(|l| format!(" {}", dimmed(l))).unwrap_or_default();
-            rows.push(format!("  {} {}{link}", colored("✗", BRIGHT_RED), colored(&job.name, WHITE)));
-        }
-        if ci.failed.len() > MAX_FAILED_ROWS {
-            rows.push(dimmed(&format!("  +{} more", ci.failed.len() - MAX_FAILED_ROWS)));
-        }
     }
+    parts
+}
 
-    let mut out: Vec<String> = head_row.into_iter().collect();
-    out.extend(wrap_segments(&parts, width));
-    out.extend(rows);
-    out
+/// One row per failed CI job, its name linked to the job.
+fn failed_job_rows(inputs: &RenderInputs) -> Vec<String> {
+    let Some(ci) = inputs.gh.as_ref().and_then(|g| g.ci.as_ref()) else { return Vec::new() };
+    let mut rows: Vec<String> = ci
+        .failed
+        .iter()
+        .take(MAX_FAILED_ROWS)
+        .map(|job| {
+            let name = colored(&job.name, WHITE);
+            let name = job.link.as_deref().map_or_else(|| name.clone(), |url| link(&name, url));
+            format!("  {} {name}", colored("✗", BRIGHT_RED))
+        })
+        .collect();
+    if ci.failed.len() > MAX_FAILED_ROWS {
+        rows.push(dimmed(&format!("  +{} more", ci.failed.len() - MAX_FAILED_ROWS)));
+    }
+    rows
 }
 
 /// Greedy wrap at segment boundaries: Claude Code renders each stdout line
@@ -197,13 +238,12 @@ pub fn render_segments(payload: &StatusPayload, inputs: &RenderInputs) -> Vec<St
         parts.push(format!("{} {}", colored(&format!("+{added}"), BRIGHT_GREEN), colored(&format!("-{removed}"), BRIGHT_RED)));
     }
 
-    // With a target the branch leads the GitHub rows instead, so it is not
-    // said twice; otherwise it carries its PR number and review state.
+    // A branch with a PR leads the PR row instead.
     if inputs.shows("branch")
-        && let Some(branch) = inputs.branch.as_ref().filter(|_| target(inputs).is_none())
+        && inputs.gh.as_ref().and_then(|g| g.pr_number).is_none()
+        && let Some(branch) = inputs.branch.as_ref()
     {
-        let pr = inputs.gh.as_ref().and_then(|g| g.pr_number).map(|n| format!(" {}{}", pr_number(n), review_marker(payload)));
-        parts.push(format!("{}{}", colored(branch, CYAN), pr.unwrap_or_default()));
+        parts.push(inputs.branch_label(branch));
     }
 
     parts

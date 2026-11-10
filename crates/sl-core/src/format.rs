@@ -17,6 +17,11 @@ pub fn dimmed(text: &str) -> String {
     text.dimmed().to_string()
 }
 
+/// An OSC 8 hyperlink, ended by BEL as Claude Code's status line docs show.
+pub fn link(text: &str, url: &str) -> String {
+    format!("\x1b]8;;{url}\x07{text}\x1b]8;;\x07")
+}
+
 /// Token counts the way the status line shows them: 46090 -> "46.1k",
 /// 200000 -> "200k", 1000000 -> "1M", 950 -> "950". Rounded before the unit
 /// is picked, so 999,960 reads "1M", not "1000.0k".
@@ -201,9 +206,12 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-// Braille gradient, empty -> full. Each bar cell has (length - 1) sub-levels.
-const GRADIENT: [&str; 7] = ["⣀", "⣄", "⣤", "⣦", "⣶", "⣷", "⣿"];
-const EMPTY_CHAR: &str = "⣀";
+/**
+ * Braille gradient, empty -> full. Each bar cell has (length - 1) sub-levels.
+ * Six-dot cells only: the bottom dot row sits on the line below.
+ */
+const GRADIENT: [&str; 5] = ["⠤", "⠦", "⠶", "⠷", "⠿"];
+const EMPTY_CHAR: &str = "⠤";
 
 pub fn pct_color(pct: f64) -> Rgb {
     if pct >= 80.0 {
@@ -398,21 +406,20 @@ mod tests {
 
     #[test]
     fn make_bar_empty_and_full() {
-        assert_eq!(make_bar(0.0, 6, true), "⣀⣀⣀⣀⣀⣀");
-        assert_eq!(make_bar(100.0, 6, true), "⣿⣿⣿⣿⣿⣿");
+        assert_eq!(make_bar(0.0, 6, true), "⠤⠤⠤⠤⠤⠤");
+        assert_eq!(make_bar(100.0, 6, true), "⠿⠿⠿⠿⠿⠿");
     }
 
     #[test]
     fn make_bar_partial_fill_uses_gradient_glyphs() {
-        let bar = make_bar(50.0, 6, true);
-        assert_eq!(bar.chars().count(), 6);
-        assert!(bar.starts_with("⣿⣿⣿"));
+        assert_eq!(make_bar(50.0, 6, true), "⠿⠿⠿⠤⠤⠤");
+        assert_eq!(make_bar(63.0, 6, true), "⠿⠿⠿⠷⠤⠤");
     }
 
     #[test]
     fn make_bar_clamps_out_of_range_percentages() {
-        assert_eq!(make_bar(250.0, 6, true), "⣿⣿⣿⣿⣿⣿");
-        assert_eq!(make_bar(-10.0, 6, true), "⣀⣀⣀⣀⣀⣀");
+        assert_eq!(make_bar(250.0, 6, true), "⠿⠿⠿⠿⠿⠿");
+        assert_eq!(make_bar(-10.0, 6, true), "⠤⠤⠤⠤⠤⠤");
     }
 
     #[test]

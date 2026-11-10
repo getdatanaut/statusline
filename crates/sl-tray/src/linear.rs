@@ -8,6 +8,8 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use sl_core::branch::ticket_id;
+
 use crate::sessions::Tone;
 
 /// A ticket's lookup is abandoned after this long: it runs on the sessions
@@ -25,24 +27,6 @@ pub struct LinearInfo {
     pub url: String,
     /// The workflow state's name: `In Progress`, `In Review`...
     pub state: String,
-}
-
-/// First words of branch names that look like `word-123` but are not teams.
-const NOT_TEAMS: [&str; 9] = ["fix", "feat", "feature", "chore", "bug", "hotfix", "release", "pr", "v"];
-
-/// The ticket a branch is named for: `DN-479` from `jakub/dn-479-ontology-m4`.
-/// The team key and a number open the last path segment, after any `user/`.
-pub fn ticket_id(branch: &str) -> Option<String> {
-    let segment = branch.rsplit('/').next()?;
-    let (team, rest) = segment.split_once('-')?;
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    let after = rest.get(digits.len()..).unwrap_or("");
-    let team_ok = (1..=10).contains(&team.len()) && team.chars().all(|c| c.is_ascii_alphanumeric()) && team.starts_with(|c: char| c.is_ascii_alphabetic());
-    let ends_ok = after.is_empty() || after.starts_with('-');
-    if !team_ok || digits.is_empty() || digits.len() > 6 || !ends_ok || NOT_TEAMS.contains(&team.to_ascii_lowercase().as_str()) {
-        return None;
-    }
-    Some(format!("{}-{digits}", team.to_ascii_uppercase()))
 }
 
 /// The ticket from `linear issue view --json`; `None` if it is not one.
@@ -115,20 +99,6 @@ impl LinearCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_ticket_is_named_by_the_branchs_last_segment() {
-        assert_eq!(ticket_id("jakub/dn-479-ontology-m4-base").as_deref(), Some("DN-479"));
-        assert_eq!(ticket_id("DN-12").as_deref(), Some("DN-12"));
-        assert_eq!(ticket_id("feature/eng-7-thing").as_deref(), Some("ENG-7"));
-    }
-
-    #[test]
-    fn branches_without_a_ticket_have_none() {
-        for branch in ["main", "feat/tray-stats-window", "fix-123-typo", "jakub/dn-notes", "dn-12abc", "jakub/dn-1234567-x", "release/v-1", "-5"] {
-            assert_eq!(ticket_id(branch), None, "{branch}");
-        }
-    }
 
     #[test]
     fn a_ticket_is_read_from_the_tools_json() {

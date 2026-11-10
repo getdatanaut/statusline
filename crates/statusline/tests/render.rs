@@ -1,7 +1,7 @@
 #![expect(clippy::unwrap_used, clippy::expect_used, reason = "fixtures, which fail the test loudly")]
 use statusline::ansi::strip_ansi;
 use statusline::format::parse_iso8601_to_epoch_ms as iso_ms;
-use statusline::render::{render, wrap_segments, RenderInputs};
+use statusline::render::{render, wrap_segments, RenderInputs, RenderOptions};
 use statusline::types::{SessionState, StatusPayload};
 
 // Modeled on a real payload from Claude Code 2.1.173 (Fable 5 [1m] on Max 5x).
@@ -40,7 +40,7 @@ fn base_inputs() -> RenderInputs {
         branch: Some("main".to_string()),
         auto_compact_window: None,
         gh: None,
-        hidden: Vec::new(),
+        options: RenderOptions::default(),
     }
 }
 
@@ -52,18 +52,18 @@ fn plain(payload: &StatusPayload, inputs: &RenderInputs) -> String {
 fn full_line_with_all_segments() {
     assert_eq!(
         plain(&base_payload(), &base_inputs()),
-        "Session ⣄⣀⣀⣀⣀⣀ 3% 4h 46m | Weekly ⣿⣿⣶⣀⣀⣀ 45% 13h 26m | \
-         Context ⣤⣀⣀⣀⣀⣀ 46.1k/1M | $1.85 | Fable 5 | [|] 12 tools 5m | +4 -1 | main"
+        "Session ⠦⠤⠤⠤⠤⠤ 3% 4h 46m | Weekly ⠿⠿⠷⠤⠤⠤ 45% 13h 26m | \
+         Context ⠦⠤⠤⠤⠤⠤ 46.1k/1M | $1.85 | Fable 5 | [|] 12 tools 5m | +4 -1 | main"
     );
 }
 
 #[test]
 fn hidden_segments_are_left_out() {
     let mut inputs = base_inputs();
-    inputs.hidden = vec!["session".into(), "tools".into(), "lines".into()];
+    inputs.options.hidden = vec!["session".into(), "tools".into(), "lines".into()];
     assert_eq!(
         plain(&base_payload(), &inputs),
-        "Weekly ⣿⣿⣶⣀⣀⣀ 45% 13h 26m | Context ⣤⣀⣀⣀⣀⣀ 46.1k/1M | $1.85 | Fable 5 | main"
+        "Weekly ⠿⠿⠷⠤⠤⠤ 45% 13h 26m | Context ⠦⠤⠤⠤⠤⠤ 46.1k/1M | $1.85 | Fable 5 | main"
     );
 }
 
@@ -91,7 +91,7 @@ fn context_bar_fills_against_the_effective_limit_not_the_model_window() {
     let mut inputs = base_inputs();
     inputs.auto_compact_window = Some(200_000);
     // 100k of 200k = 50% — bar half full even though it's 10% of the model window
-    assert!(plain(&half, &inputs).contains("Context ⣿⣿⣿⣀⣀⣀ 100k/200k"));
+    assert!(plain(&half, &inputs).contains("Context ⠿⠿⠿⠤⠤⠤ 100k/200k"));
 }
 
 #[test]
@@ -117,7 +117,7 @@ fn missing_pieces_drop_their_segments_instead_of_crashing() {
         branch: None,
         auto_compact_window: None,
         gh: None,
-        hidden: Vec::new(),
+        options: RenderOptions::default(),
     };
     assert_eq!(plain(&parse("{}"), &empty_inputs), "");
 
@@ -286,87 +286,62 @@ fn ci(state: statusline::gh::CiState, failed: &[(&str, Option<&str>)], pending: 
     }
 }
 
-fn gh_plain(inputs: &RenderInputs) -> Vec<String> {
-    statusline::render::gh_rows(inputs, "", None).iter().map(|r| strip_ansi(r)).collect()
+/** The rows under the main line, without colors. */
+fn pr_rows(payload: &StatusPayload, inputs: &RenderInputs) -> Vec<String> {
+    strip_ansi(&render(payload, inputs, None)).lines().skip(1).map(String::from).collect()
 }
 
 #[test]
-fn target_is_head_with_its_pr_then_base_with_commit_and_its_own_pr() {
-    assert_eq!(
-        gh_plain(&gh_inputs("develop", None)),
-        vec!["feat/x (#730)", "  → develop (1adc44e1c5) (#729)"]
-    );
-}
-
-#[test]
-fn base_without_its_own_pr_omits_that_number() {
-    let mut inputs = gh_inputs("develop", None);
-    inputs.gh.as_mut().unwrap().base_pr = None;
-    assert_eq!(gh_plain(&inputs), vec!["feat/x (#730)", "  → develop (1adc44e1c5)"]);
-}
-
-#[test]
-fn ci_and_draft_join_the_base_row() {
+fn a_stacked_pr_is_one_row_its_state_then_the_branch_it_is_stacked_on() {
     let mut inputs = gh_inputs("develop", Some(ci(statusline::gh::CiState::Passing, &[], 0)));
     inputs.gh.as_mut().unwrap().is_draft = Some(true);
-    assert_eq!(
-        gh_plain(&inputs),
-        vec!["feat/x (#730)", "  → develop (1adc44e1c5) (#729) | draft | ✓ CI passing"]
-    );
-}
-
-#[test]
-fn review_state_follows_the_head_pr_number() {
-    let rows = statusline::render::gh_rows(&gh_inputs("develop", None), " ✓", None);
-    assert_eq!(strip_ansi(&rows[0]), "feat/x (#730) ✓");
-}
-
-#[test]
-fn pr_to_the_default_branch_has_no_target_rows_and_the_main_line_carries_the_number() {
-    let inputs = gh_inputs("main", Some(ci(statusline::gh::CiState::Passing, &[], 0)));
-    assert_eq!(gh_plain(&inputs), vec!["✓ CI passing"]);
-    let main_line = strip_ansi(&render(&base_payload(), &inputs, None)).lines().next().unwrap().to_string();
-    assert!(main_line.ends_with("feat/x (#730)"), "{main_line}");
-}
-
-#[test]
-fn branch_is_not_repeated_on_the_main_line_when_the_target_rows_show() {
-    let out = strip_ansi(&render(&base_payload(), &gh_inputs("develop", None), None));
+    let mut payload = base_payload();
+    payload.pr = Some(serde_json::from_str(r#"{"number":730,"url":"https://github.com/o/r/pull/730","review_state":"approved"}"#).unwrap());
+    let out = strip_ansi(&render(&payload, &inputs, None));
     let lines: Vec<&str> = out.lines().collect();
-    assert!(!lines[0].contains("feat/x"));
-    assert_eq!(&lines[1..], ["feat/x (#730)", "  → develop (1adc44e1c5) (#729)"]);
+    assert!(!lines[0].contains("feat/x"), "the branch is not said twice: {out}");
+    assert_eq!(&lines[1..], ["feat/x (#730) ✓ → develop (#729) | draft | ✓ CI passing"]);
+    assert!(!out.contains("github.com"), "urls only inside links: {out}");
 }
 
 #[test]
-fn no_pr_url_is_printed_anywhere() {
-    let mut payload = parse(BASE_PAYLOAD);
-    payload.pr = Some(
-        serde_json::from_str(r#"{"number":730,"url":"https://github.com/o/r/pull/730","review_state":"approved"}"#)
-            .unwrap(),
-    );
-    let out = strip_ansi(&render(&payload, &gh_inputs("develop", None), None));
-    assert!(!out.contains("github.com"), "{out}");
-    assert!(out.contains("feat/x (#730) ✓"), "{out}");
+fn a_pr_to_the_default_branch_or_a_base_without_a_pr_has_no_parent_number() {
+    let mut inputs = gh_inputs("main", None);
+    inputs.gh.as_mut().unwrap().is_draft = Some(false);
+    assert_eq!(pr_rows(&base_payload(), &inputs), vec!["feat/x (#730) | ready"]);
+    let mut inputs = gh_inputs("develop", None);
+    inputs.gh.as_mut().unwrap().base_pr = None;
+    assert_eq!(pr_rows(&base_payload(), &inputs), vec!["feat/x (#730) → develop"]);
 }
 
 #[test]
-fn red_ci_lists_failed_jobs_with_links_and_caps_the_rest() {
+fn ticket_branches_show_and_link_their_ticket_and_pr_numbers_link_their_pr() {
+    let mut inputs = gh_inputs("marc/dn-543-parent", None);
+    inputs.branch = Some("marc/dn-544-child".into());
+    inputs.gh.as_mut().unwrap().url = Some("https://github.com/o/r/pull/730".into());
+    inputs.options.user = Some("marc".into());
+    inputs.options.linear_workspace = Some("acme".into());
+    assert_eq!(pr_rows(&base_payload(), &inputs), vec!["DN-544-child (#730) → DN-543-parent (#729)"]);
+    let out = render(&base_payload(), &inputs, None);
+    for url in ["https://linear.app/acme/issue/DN-544", "https://github.com/o/r/pull/730", "https://linear.app/acme/issue/DN-543", "https://github.com/o/r/pull/729"] {
+        assert!(out.contains(&format!("\x1b]8;;{url}\x07")), "{url} in {out:?}");
+    }
+}
+
+#[test]
+fn red_ci_links_the_checks_and_lists_failed_jobs_linked_capping_the_rest() {
     use statusline::gh::CiState::Failing;
     let failed = [("lint", Some("https://x/1")), ("e2e", None), ("unit", Some("https://x/3")), ("types", None), ("docs", None)];
-    let rows = gh_plain(&gh_inputs("main", Some(ci(Failing, &failed, 0))));
+    let mut inputs = gh_inputs("main", Some(ci(Failing, &failed, 0)));
+    inputs.gh.as_mut().unwrap().url = Some("https://github.com/o/r/pull/730".into());
     assert_eq!(
-        rows,
-        vec!["✗ CI failed: 5", "  ✗ lint https://x/1", "  ✗ e2e", "  ✗ unit https://x/3", "  +2 more"]
+        pr_rows(&base_payload(), &inputs),
+        vec!["feat/x (#730) | ✗ CI failed: 5", "  ✗ lint", "  ✗ e2e", "  ✗ unit", "  +2 more"]
     );
-}
-
-#[test]
-fn draft_state_shows_even_without_a_target() {
-    let mut inputs = gh_inputs("main", None);
-    inputs.gh.as_mut().unwrap().is_draft = Some(true);
-    assert_eq!(gh_plain(&inputs), vec!["draft"]);
-    inputs.gh.as_mut().unwrap().is_draft = Some(false);
-    assert_eq!(gh_plain(&inputs), vec!["ready"]);
+    let out = render(&base_payload(), &inputs, None);
+    for url in ["https://github.com/o/r/pull/730/checks", "https://x/1", "https://x/3"] {
+        assert!(out.contains(&format!("\x1b]8;;{url}\x07")), "{url} in {out:?}");
+    }
 }
 
 #[test]

@@ -2413,7 +2413,7 @@ pub(crate) fn preview_samples(now: i64) -> (Vec<OpenSession>, Vec<MeterSlot>) {
         pid: None,
         // As the status line would report: some fuller than others.
         context: Some(sl_core::types::ContextCapture { percent: (id.len() as f64 * 7.0) % 95.0, used_tokens: None, limit_tokens: None, captured_at_ms: now }),
-        linear: crate::linear::ticket_id(branch).map(|id| crate::linear::LinearInfo {
+        linear: sl_core::branch::ticket_id(branch).map(|id| crate::linear::LinearInfo {
             url: format!("https://linear.app/x/issue/{id}"),
             state: ["In Progress", "In Review", "Todo"][id.len() % 3].into(),
             id,
