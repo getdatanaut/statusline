@@ -4,8 +4,8 @@ A fast status line for Claude Code, and a macOS menu bar tray for Claude Code
 and Codex usage and sessions, written in Rust.
 
 ```
-Session ⣄⣀⣀⣀⣀⣀ 3% 4h 34m | Weekly ⣿⣿⣶⣀⣀⣀ 45% 13h 14m | Context ⣦⣀⣀⣀⣀⣀ 46.1k/600k | cache 18k hit / 2k miss | $1.85 | Fable 5 | [-] 12 tools 5m | +4 -1 | feat/child (#730)
-  → feat/parent (1adc44e1c5) (#729) | ✓ CI passing
+Session ⠦⠤⠤⠤⠤⠤ 3% 4h 34m | Weekly ⠿⠿⠷⠤⠤⠤ 45% 13h 14m | Context ⠶⠤⠤⠤⠤⠤ 46.1k/600k | cache 18k hit / 2k miss | $1.85 | Fable 5 | [-] 12 tools 5m | +4 -1
+feat/child (#730) ✓ → feat/parent (#729) | draft | ✓ CI passing
 ```
 
 On narrow terminals the line wraps at segment boundaries into multiple status
@@ -39,23 +39,26 @@ Segments (each drops out silently when its data is unavailable):
   (read off `.git/HEAD`, worktrees included, without starting `git`), so it
   can't go stale or leak between concurrent sessions. Shows `@<sha>` when
   detached (asking `git` for the short sha); the branch a `--worktree`
-  session's worktree was made on only stands in outside a repository.
-- **PR** — the branch's open PR as `(#730)` plus the review state (`✓`
-  approved, `✗` changes requested). Plain text, not a link: Claude Code
-  doesn't pass OSC 8 hyperlinks from statusline output to the terminal.
-  When the PR targets something other than `main`/`master`, it gets its own
-  rows (data from `gh`, cached under `~/.cache/statusline/gh/` and refreshed
-  in the background, so it appears one refresh late):
+  session's worktree was made on only stands in outside a repository. Your own `$USER/` prefix is dropped and, past 40
+  characters, the end. A Linear ticket opening the name is uppercased
+  (`jakub/dn-479-ontology-m4` is `DN-479-ontology-m4` to anyone but jakub)
+  and, with `--linear-workspace <slug>`, linked to the ticket.
+- **PR** — a branch with an open PR moves to a row of its own: the branch,
+  `(#730)` linked to the PR, the review state (`✓` approved, `✗` changes
+  requested), `draft`/`ready`, and CI (linked to the PR's checks): passing,
+  running, or failed with up to three failed jobs on rows below, each linked
+  to its job. When the PR targets something other than `main`/`master`, `→`
+  after the PR names that branch and *its own* open PR (the parent in a
+  stack).
+  Data from `gh`, cached under `~/.cache/statusline/gh/` and refreshed in the
+  background, so it appears one refresh late. Links are OSC 8: Cmd+click in
+  terminals that support them. Claude Code only passes them on in terminals
+  it recognizes; elsewhere (Zed's terminal, for one) set `FORCE_HYPERLINK=1`.
 
   ```
-  feat/child (#730) ✓
-    → feat/parent (1adc44e1c5) (#729) | draft | ✓ CI passing
-    ✗ lint https://github.com/…/runs/…
+  feat/child (#730) ✓ → feat/parent (#729) | ✗ CI failed: 1
+    ✗ lint
   ```
-
-  The base shows its tip commit and *its own* open PR (the parent in a
-  stack). `draft`/`ready`, then CI: passing, running, or failed with up to
-  three failed jobs and their bare URLs.
 
 ## Why not claude-pulse?
 
@@ -104,6 +107,8 @@ Both commands need an absolute path (`~` is not expanded).
 To drop segments, pass their names to `--hide`, e.g.
 `statusline --hide cache,api,tools,lines`. Names: `session`, `weekly`,
 `context`, `cache`, `cost`, `model`, `tools`, `api`, `lines`, `branch`.
+`--linear-workspace datanaut` links ticket labels to
+`linear.app/datanaut/issue/<id>`.
 `refreshInterval` re-renders every 30s so reset countdowns stay current while
 idle. The hook is optional — without it the tools segment simply doesn't
 render. After changing the source, re-run `cargo install --path crates/statusline`
