@@ -782,6 +782,8 @@ struct ClosedMenu {
     row: Row,
     view: RowView,
     header: HeaderView,
+    /// "Open worktree in Zed": hidden once the directory is gone.
+    zed: Row,
 }
 
 impl ClosedRows {
@@ -824,9 +826,10 @@ impl ClosedMenu {
         view_row(mtm, &sub, &header);
         Row::separator(mtm, &sub);
         let add = |symbol, title, selector| {
-            let (_, _view) = action_row(mtm, &sub, selector, &target, action(symbol, title));
+            let (row, _view) = action_row(mtm, &sub, selector, &target, action(symbol, title));
+            row
         };
-        add(
+        let zed = add(
             crate::zed_logo::SYMBOL,
             "Open worktree in Zed",
             Act::OpenClosedZed,
@@ -839,6 +842,7 @@ impl ClosedMenu {
             row,
             view,
             header,
+            zed,
         }
     }
 
@@ -847,6 +851,12 @@ impl ClosedMenu {
         self.row.show();
         self.view.set(closed_row(entry, mark, now));
         self.header.set(closed_header(entry, now));
+        // A removed worktree has nothing to open.
+        if std::path::Path::new(&entry.cwd).is_dir() {
+            self.zed.show();
+        } else {
+            self.zed.hide();
+        }
     }
 }
 

@@ -1123,11 +1123,13 @@ fn build_closed_card(
         view.addSubview(&line);
         y += line.frame().size.height + 6.0;
         let slot = (inner - 4.0 * GAP) / 5.0;
-        let actions = [
-            ("Zed", crate::zed_logo::SYMBOL, Act::OpenClosedZed),
-            ("Copy resume command", "doc.on.doc", Act::CopyClosedId),
-            ("Dismiss", "xmark.circle", Act::DismissClosed),
-        ];
+        let mut actions = vec![];
+        // A removed worktree has nothing to open.
+        if std::path::Path::new(&entry.cwd).is_dir() {
+            actions.push(("Zed", crate::zed_logo::SYMBOL, Act::OpenClosedZed));
+        }
+        actions.push(("Copy resume command", "doc.on.doc", Act::CopyClosedId));
+        actions.push(("Dismiss", "xmark.circle", Act::DismissClosed));
         for (i, (title, symbol, act)) in actions.into_iter().enumerate() {
             let button = action_button(mtm, title, symbol, act, target.clone());
             let x = (DETAIL_X + i as f64 * (slot + GAP)).round();
