@@ -8,8 +8,8 @@
 use objc2::Message;
 use objc2::rc::Retained;
 use objc2_app_kit::{
-    NSButton, NSControl, NSImageView, NSMenu, NSMenuItem, NSScrollView, NSSegmentedControl,
-    NSTabView, NSTextField, NSView, NSWindow,
+    NSAccessibility, NSButton, NSControl, NSImageView, NSMenu, NSMenuItem, NSPopUpButton,
+    NSScrollView, NSSegmentedControl, NSSwitch, NSTabView, NSTextField, NSView, NSWindow,
 };
 use std::fmt::Write as _;
 
@@ -172,6 +172,37 @@ pub(crate) fn line(view: &NSView) -> Option<String> {
             .collect();
         return Some(format!("segmented [{}]", labels.join(" | ")));
     }
+    if let Some(popup) = view.downcast_ref::<NSPopUpButton>() {
+        let current = popup.indexOfSelectedItem();
+        let labels: Vec<String> = popup
+            .itemTitles()
+            .to_vec()
+            .iter()
+            .enumerate()
+            .map(|(i, title)| {
+                if isize::try_from(i).ok() == Some(current) {
+                    format!("*{title}")
+                } else {
+                    title.to_string()
+                }
+            })
+            .collect();
+        return Some(format!("segmented [{}]", labels.join(" | ")));
+    }
+    if let Some(switch) = view.downcast_ref::<NSSwitch>() {
+        let on = if switch.state() == objc2_app_kit::NSControlStateValueOn {
+            " on"
+        } else {
+            ""
+        };
+        return Some(format!(
+            "button {:?}{on}",
+            switch
+                .accessibilityLabel()
+                .map(|l| l.to_string())
+                .unwrap_or_default()
+        ));
+    }
     if let Some(button) = view.downcast_ref::<NSButton>() {
         let title = button.title().to_string();
         let tip = button
@@ -321,6 +352,12 @@ fn strip_counts(raw: &str) -> String {
 
 /// What a control is called: its title, else what it shows.
 fn raw_label(view: &NSView) -> String {
+    if let Some(switch) = view.downcast_ref::<NSSwitch>() {
+        return switch
+            .accessibilityLabel()
+            .map(|label| label.to_string())
+            .unwrap_or_default();
+    }
     if let Some(button) = view.downcast_ref::<NSButton>() {
         let title = button.title().to_string();
         if !title.is_empty() {
@@ -381,7 +418,19 @@ pub(crate) fn controls_in_view(view: &NSView, prefix: &str, out: &mut Vec<(Strin
             out.push((name, Target::Control(control.retain(), None)));
             return;
         }
-        if let Some(segmented) = view.downcast_ref::<NSSegmentedControl>() {
+        if let Some(popup) = view.downcast_ref::<NSPopUpButton>() {
+            let titles = popup.itemTitles().to_vec();
+            let current = usize::try_from(popup.indexOfSelectedItem()).ok();
+            for i in rotated(titles.len(), current) {
+                out.push((
+                    format!("{prefix} / [{}]", strip_counts(&titles[i].to_string())),
+                    Target::Control(
+                        control.retain(),
+                        Some(isize::try_from(i).unwrap_or(isize::MAX)),
+                    ),
+                ));
+            }
+        } else if let Some(segmented) = view.downcast_ref::<NSSegmentedControl>() {
             let count = usize::try_from(segmented.segmentCount()).unwrap_or(0);
             let current = usize::try_from(segmented.selectedSegment()).ok();
             for i in rotated(count, current) {
@@ -468,6 +517,23 @@ pub(crate) fn number_repeats(controls: &mut [(String, Target)]) {
 pub(crate) fn fire(target: &Target) {
     match target {
         Target::Control(control, segment) => {
+            if let Some(popup) = control.downcast_ref::<NSPopUpButton>() {
+                if let Some(index) = segment {
+                    popup.selectItemAtIndex(*index);
+                }
+                sl_macos::action::fire(control);
+                return;
+            }
+            if let Some(switch) = control.downcast_ref::<NSSwitch>() {
+                let on = switch.state() == objc2_app_kit::NSControlStateValueOn;
+                switch.setState(if on {
+                    objc2_app_kit::NSControlStateValueOff
+                } else {
+                    objc2_app_kit::NSControlStateValueOn
+                });
+                sl_macos::action::fire(control);
+                return;
+            }
             if let Some(button) = control.downcast_ref::<NSButton>() {
                 sl_macos::system::perform_click(button);
                 return;

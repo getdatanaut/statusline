@@ -1814,7 +1814,7 @@ impl BarController {
 
     /// Settings: how many open sessions are listed, by segment.
     fn settings_max_sessions(&self, sender: &AnyObject) {
-        if let Some(count) = usize::try_from(sl_macos::action::selected_segment(sender))
+        if let Some(count) = usize::try_from(sl_macos::action::slider_value(sender))
             .ok()
             .and_then(|i| view_prefs::MAX_SESSION_CHOICES.get(i))
         {

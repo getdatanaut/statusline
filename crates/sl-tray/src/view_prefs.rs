@@ -588,7 +588,7 @@ const NEEDS_YOU_DEFAULT: u64 = 15;
 pub const RING_POINTS: [(u8, u8); 3] = [(60, 80), (70, 85), (80, 90)];
 const RING_DEFAULT: (u8, u8) = (70, 85);
 /// How many open sessions are listed; the rest are counted.
-pub const MAX_SESSION_CHOICES: [u64; 3] = [4, 8, 16];
+pub const MAX_SESSION_CHOICES: [u64; 9] = [1, 2, 4, 6, 8, 10, 12, 14, 16];
 const MAX_SESSIONS_DEFAULT: u64 = 16;
 
 const CACHE_LEAD_KEY: &str = "cacheLeadMins";
@@ -916,10 +916,10 @@ pub(crate) mod tests {
     fn choices_are_in_order_and_include_their_defaults() {
         for (choices, default) in [
             (&USAGE_EVERY[..], USAGE_DEFAULT),
+            (&MAX_SESSION_CHOICES[..], MAX_SESSIONS_DEFAULT),
             (&PR_EVERY[..], PR_DEFAULT),
             (&CACHE_LEAD_MINS[..], CACHE_LEAD_DEFAULT),
             (&NEEDS_YOU_MINS[..], NEEDS_YOU_DEFAULT),
-            (&MAX_SESSION_CHOICES[..], MAX_SESSIONS_DEFAULT),
         ] {
             assert!(
                 choices.windows(2).all(|pair| pair[0] < pair[1]),

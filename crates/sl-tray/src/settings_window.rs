@@ -18,14 +18,20 @@
 //! menu from a click in its first, and a window can hold more than choices.
 //! Every control acts at once; there is nothing to apply or save.
 
+use std::rc::Rc;
+
 use crate::act::Act;
 use objc2::MainThreadOnly;
 use objc2::rc::Retained;
 use objc2_app_kit::{
-    NSApplication, NSButton, NSControlStateValueOff, NSControlStateValueOn, NSFont,
-    NSSegmentedControl, NSTabView, NSTextField, NSView, NSWindow, NSWindowStyleMask,
+    NSAccessibility, NSApplication, NSBox, NSBoxType, NSButton, NSColor, NSControlSize,
+    NSControlStateValueOff, NSControlStateValueOn, NSFont, NSImage, NSImageView,
+    NSMutableParagraphStyle, NSPopUpButton, NSSlider, NSSplitViewController, NSSplitViewItem,
+    NSSwitch, NSTabView, NSTabViewType, NSTextAlignment, NSTextField, NSTitlePosition, NSToolbar,
+    NSView, NSViewController, NSWindow, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSWindowToolbarStyle,
 };
-use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{MainThreadMarker, NSAttributedString, NSPoint, NSRect, NSSize, NSString};
 
 use crate::meters::FlippedView;
 use crate::view_prefs::{
@@ -33,12 +39,25 @@ use crate::view_prefs::{
     SortOrder, Tuning,
 };
 
-const WIDTH: f64 = 440.0;
-const MARGIN: f64 = 20.0;
-/// Where controls start, after the row labels.
-const CONTROL_X: f64 = 112.0;
-/// What the tab strip takes above and beside a tab's content.
-const TAB_CHROME: f64 = 44.0;
+const WIDTH: f64 = 460.0;
+/// A tab's content is a little narrower than the window.
+const PAGE_WIDTH: f64 = WIDTH;
+/// The sidebar's width, and a row's height in it.
+const SIDEBAR_WIDTH: f64 = 176.0;
+const SIDEBAR_ROW: f64 = 32.0;
+/// The bar above a page: the traffic lights on the sidebar's side, the page's
+/// name on the other.
+const TOP_BAR: f64 = 56.0;
+/// A sidebar row's distance from the sidebar's edges.
+const SIDEBAR_INSET: f64 = 10.0;
+/// The cards' left edge and width in a page.
+const CARD_X: f64 = 20.0;
+const CARD_WIDTH: f64 = PAGE_WIDTH - 2.0 * CARD_X;
+/// A row's text and control sit this far in from the card's edge.
+const ROW_INSET: f64 = 14.0;
+const ROW_PAD: f64 = 9.0;
+const MIN_ROW: f64 = 38.0;
+const POPUP_WIDTH: f64 = 130.0;
 
 /// Everything the controls show: the settings in use.
 pub(crate) struct SettingsState {
@@ -53,125 +72,257 @@ pub(crate) struct SettingsState {
 
 pub(crate) struct SettingsWindow {
     window: Retained<NSWindow>,
-    layout: Retained<NSSegmentedControl>,
-    meters: Retained<NSSegmentedControl>,
-    spend: Retained<NSButton>,
-    linear: Retained<NSButton>,
-    bar_window: Retained<NSSegmentedControl>,
-    bar_badge: Retained<NSButton>,
-    usage: Retained<NSSegmentedControl>,
-    pr: Retained<NSSegmentedControl>,
+    /// Switch the sidebar and the page to the one at this index.
+    show_page: Rc<dyn Fn(usize)>,
+    layout: Retained<NSPopUpButton>,
+    meters: Retained<NSPopUpButton>,
+    spend: Retained<NSSwitch>,
+    linear: Retained<NSSwitch>,
+    bar_window: Retained<NSPopUpButton>,
+    bar_badge: Retained<NSSwitch>,
+    usage: Retained<NSPopUpButton>,
+    pr: Retained<NSPopUpButton>,
     /// `None` when the tray may not hold the Mac awake at all.
-    auto: Option<Retained<NSButton>>,
+    auto: Option<Retained<NSSwitch>>,
     /// `None` with `auto`.
-    rc: Option<Retained<NSButton>>,
-    sort: Retained<NSSegmentedControl>,
-    cold: Retained<NSSegmentedControl>,
-    max_sessions: Retained<NSSegmentedControl>,
-    density: Retained<NSSegmentedControl>,
-    needs_you: Retained<NSSegmentedControl>,
-    cache_lead: Retained<NSSegmentedControl>,
-    ring: Retained<NSSegmentedControl>,
-    notify: Vec<Retained<NSButton>>,
+    rc: Option<Retained<NSSwitch>>,
+    sort: Retained<NSPopUpButton>,
+    cold: Retained<NSPopUpButton>,
+    max_sessions: Retained<NSSlider>,
+    /// The number beside the slider.
+    max_sessions_label: Retained<NSTextField>,
+    density: Retained<NSPopUpButton>,
+    needs_you: Retained<NSPopUpButton>,
+    cache_lead: Retained<NSPopUpButton>,
+    ring: Retained<NSPopUpButton>,
+    notify: Vec<Retained<NSSwitch>>,
 }
 
-/// Lays controls down one column of a tab.
+/// Lays grouped cards down one column of a tab, as System Settings does: a
+/// rounded card per group, a row per setting with its title (and a grey line
+/// under it) on the left and its control on the right.
 struct Page {
     mtm: MainThreadMarker,
     content: FlippedView,
     y: f64,
+    card: Option<Card>,
+}
+
+/// The card being filled: its box, where it starts, and its rows so far.
+struct Card {
+    shape: Retained<NSBox>,
+    top: f64,
+    rows: usize,
 }
 
 impl Page {
     fn new(mtm: MainThreadMarker) -> Self {
         let content = FlippedView::new(
             mtm,
-            NSRect::new(
-                NSPoint::new(0.0, 0.0),
-                NSSize::new(WIDTH - 2.0 * 12.0, 300.0),
-            ),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(PAGE_WIDTH, 300.0)),
         );
         Self {
             mtm,
             content,
-            y: 8.0,
+            y: 10.0,
+            card: None,
         }
     }
 
     fn heading(&mut self, text: &str) {
         let label = NSTextField::labelWithString(&NSString::from_str(text), self.mtm);
         label.setFont(Some(&NSFont::systemFontOfSize_weight(
-            13.0,
+            NSFont::systemFontSize(),
             sl_macos::consts::font_weight(sl_macos::consts::Weight::Semibold),
         )));
         label.sizeToFit();
-        label.setFrameOrigin(NSPoint::new(MARGIN - 8.0, self.y));
+        label.setFrameOrigin(NSPoint::new(CARD_X + 4.0, self.y));
         self.content.addSubview(&label);
         self.y += label.frame().size.height + 8.0;
     }
 
-    fn row_label(&self, text: &str, y: f64, height: f64) {
-        let label = NSTextField::labelWithString(&NSString::from_str(text), self.mtm);
-        label.setTextColor(Some(&crate::controller::dim_color()));
+    /// Start a card; its rows follow, then [`Self::end_card`].
+    fn begin_card(&mut self) {
+        let shape = rounded_box(self.mtm, 10.0, &NSColor::quaternarySystemFillColor());
+        // First, so every row is drawn over it.
+        self.content.addSubview(&shape);
+        self.card = Some(Card {
+            shape,
+            top: self.y,
+            rows: 0,
+        });
+    }
+
+    fn end_card(&mut self) {
+        if let Some(card) = self.card.take() {
+            card.shape.setFrame(NSRect::new(
+                NSPoint::new(CARD_X, card.top),
+                NSSize::new(CARD_WIDTH, self.y - card.top),
+            ));
+            self.y += 26.0;
+        }
+    }
+
+    /// One row: `title` and an optional grey `note` under it, `control` at the
+    /// right edge, centred on the row.
+    fn row(&mut self, title: &str, note: Option<&str>, control: &NSView) {
+        if let Some(card) = &mut self.card {
+            if card.rows > 0 {
+                let line = NSBox::initWithFrame(
+                    NSBox::alloc(self.mtm),
+                    NSRect::new(
+                        NSPoint::new(CARD_X + ROW_INSET, self.y),
+                        NSSize::new(CARD_WIDTH - 2.0 * ROW_INSET, 1.0),
+                    ),
+                );
+                line.setBoxType(NSBoxType::Separator);
+                self.content.addSubview(&line);
+            }
+            card.rows += 1;
+        }
+        let control_size = control.frame().size;
+        let text_width = CARD_WIDTH - 2.0 * ROW_INSET - control_size.width - 12.0;
+
+        let label = NSTextField::labelWithString(&NSString::from_str(title), self.mtm);
         label.sizeToFit();
-        label.setFrameOrigin(NSPoint::new(
-            MARGIN + 4.0,
-            y + ((height - label.frame().size.height) / 2.0).round(),
-        ));
+        let title_height = label.frame().size.height;
+        let mut text_height = title_height;
+        let mut note_label = None;
+        if let Some(note) = note {
+            let small = NSTextField::wrappingLabelWithString(&NSString::from_str(note), self.mtm);
+            small.setTextColor(Some(&NSColor::secondaryLabelColor()));
+            small.setFont(Some(&NSFont::systemFontOfSize(
+                NSFont::smallSystemFontSize(),
+            )));
+            small.setPreferredMaxLayoutWidth(text_width);
+            let fitted = small.sizeThatFits(NSSize::new(text_width, 1000.0));
+            small.setFrameSize(NSSize::new(text_width, fitted.height));
+            text_height += 2.0 + fitted.height;
+            note_label = Some(small);
+        }
+        let height = (text_height + 2.0 * ROW_PAD).max(MIN_ROW);
+        let top = self.y + ((height - text_height) / 2.0).round();
+        label.setFrameOrigin(NSPoint::new(CARD_X + ROW_INSET, top));
         self.content.addSubview(&label);
-    }
-
-    /// A labelled row of segments, asking for `act`.
-    fn segmented(&mut self, name: &str, labels: &[&str], act: Act) -> Retained<NSSegmentedControl> {
-        let control = sl_macos::controls::segmented(self.mtm, labels);
-        crate::act::bind(&control, act);
-        control.setFrameSize(NSSize::new(
-            WIDTH - 2.0 * 12.0 - CONTROL_X - MARGIN + 8.0,
-            control.frame().size.height,
+        if let Some(small) = note_label {
+            small.setFrameOrigin(NSPoint::new(CARD_X + ROW_INSET, top + title_height + 2.0));
+            self.content.addSubview(&small);
+        }
+        control.setFrameOrigin(NSPoint::new(
+            CARD_X + CARD_WIDTH - ROW_INSET - control_size.width,
+            self.y + ((height - control_size.height) / 2.0).round(),
         ));
-        control.setSegmentDistribution(objc2_app_kit::NSSegmentDistribution::Fill);
-        control.setFrameOrigin(NSPoint::new(CONTROL_X, self.y));
-        self.content.addSubview(&control);
-        let height = control.frame().size.height;
-        self.row_label(name, self.y, height);
-        self.y += height + 8.0;
-        control
+        self.content.addSubview(control);
+        self.y += height;
     }
 
-    fn checkbox(&mut self, title: &str, act: Act, tag: isize) -> Retained<NSButton> {
-        let button = sl_macos::controls::checkbox(self.mtm, title);
-        crate::act::bind(&button, act);
-        button.setTag(tag);
-        button.sizeToFit();
-        button.setFrameOrigin(NSPoint::new(MARGIN + 2.0, self.y));
-        self.content.addSubview(&button);
-        self.y += button.frame().size.height + 6.0;
-        button
+    /// A row of choices as a pop-up menu, asking for `act`.
+    fn choice(
+        &mut self,
+        name: &str,
+        note: Option<&str>,
+        labels: &[&str],
+        act: Act,
+    ) -> Retained<NSPopUpButton> {
+        let popup = sl_macos::controls::popup(self.mtm, labels);
+        crate::act::bind(&popup, act);
+        popup.setBordered(false);
+        popup.setAlignment(NSTextAlignment::Right);
+        popup.sizeToFit();
+        popup.setFrameSize(NSSize::new(POPUP_WIDTH, popup.frame().size.height));
+        self.row(name, note, &popup);
+        popup
     }
 
-    /// A line of small grey text under a group.
-    fn note(&mut self, text: &str) {
-        let label = NSTextField::wrappingLabelWithString(&NSString::from_str(text), self.mtm);
-        label.setTextColor(Some(&crate::controller::dim_color()));
-        label.setFont(Some(&NSFont::systemFontOfSize(11.0)));
-        let width = WIDTH - 2.0 * 12.0 - 2.0 * MARGIN - 4.0;
-        label.setPreferredMaxLayoutWidth(width);
-        // `sizeToFit` would keep it on one line; ask for the height at this width.
-        let fitted = label.sizeThatFits(NSSize::new(width, 1000.0));
-        label.setFrameSize(NSSize::new(width, fitted.height));
-        label.setFrameOrigin(NSPoint::new(MARGIN + 4.0, self.y));
-        self.content.addSubview(&label);
-        self.y += label.frame().size.height + 6.0;
+    /// A row with a slider of `positions` stops, the chosen value beside it
+    /// (set by `sync`).
+    fn range(
+        &mut self,
+        name: &str,
+        positions: usize,
+        act: Act,
+    ) -> (Retained<NSSlider>, Retained<NSTextField>) {
+        const LABEL_WIDTH: f64 = 26.0;
+        let slider = sl_macos::controls::slider(self.mtm, positions);
+        crate::act::bind(&slider, act);
+        let value = NSTextField::labelWithString(&NSString::from_str(""), self.mtm);
+        value.setAlignment(NSTextAlignment::Right);
+        let height = slider.frame().size.height.max(18.0);
+        let slider_width = POPUP_WIDTH - LABEL_WIDTH - 6.0;
+        slider.setFrame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(slider_width, height),
+        ));
+        value.setFrame(NSRect::new(
+            NSPoint::new(slider_width + 6.0, 0.0),
+            NSSize::new(LABEL_WIDTH, height),
+        ));
+        let holder = NSView::initWithFrame(
+            self.mtm.alloc(),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(POPUP_WIDTH, height)),
+        );
+        holder.addSubview(&slider);
+        holder.addSubview(&value);
+        self.row(name, None, &holder);
+        (slider, value)
     }
 
-    fn gap(&mut self, points: f64) {
-        self.y += points;
+    /// A row with an on/off switch, asking for `act`.
+    fn toggle(&mut self, title: &str, act: Act, tag: isize) -> Retained<NSSwitch> {
+        let switch = sl_macos::controls::switch(self.mtm);
+        crate::act::bind(&switch, act);
+        switch.setTag(tag);
+        switch.setAccessibilityLabel(Some(&NSString::from_str(title)));
+        switch.setControlSize(NSControlSize::Mini);
+        switch.sizeToFit();
+        self.row(title, None, &switch);
+        switch
     }
 
     /// The page's height, once everything is on it.
     fn finish(&self) -> f64 {
         self.y + 6.0
     }
+}
+
+/// A rounded rectangle filled with `fill`, no border.
+fn rounded_box(mtm: MainThreadMarker, radius: f64, fill: &NSColor) -> Retained<NSBox> {
+    let shape = NSBox::initWithFrame(NSBox::alloc(mtm), NSRect::ZERO);
+    shape.setBoxType(NSBoxType::Custom);
+    shape.setTitlePosition(NSTitlePosition::NoTitle);
+    shape.setBorderWidth(0.0);
+    shape.setCornerRadius(radius);
+    shape.setContentViewMargins(NSSize::new(0.0, 0.0));
+    shape.setFillColor(fill);
+    shape
+}
+
+/// A sidebar row's title, indented past its icon; white on the selected row.
+fn sidebar_title(name: &str, selected: bool) -> Retained<NSAttributedString> {
+    let paragraph = NSMutableParagraphStyle::new();
+    paragraph.setFirstLineHeadIndent(36.0);
+    paragraph.setAlignment(NSTextAlignment::Left);
+    let color = if selected {
+        NSColor::whiteColor()
+    } else {
+        NSColor::labelColor()
+    };
+    sl_macos::text::attributed(
+        name,
+        &sl_macos::text::Attrs {
+            font: Some(&NSFont::systemFontOfSize_weight(
+                NSFont::systemFontSize(),
+                sl_macos::consts::font_weight(if selected {
+                    sl_macos::consts::Weight::Semibold
+                } else {
+                    sl_macos::consts::Weight::Regular
+                }),
+            )),
+            color: Some(&color),
+            paragraph: Some(&paragraph),
+            ..Default::default()
+        },
+    )
 }
 
 fn labels_of<T: Copy>(items: &[T], label: impl Fn(T) -> String) -> Vec<String> {
@@ -190,42 +341,46 @@ impl SettingsWindow {
         // ---- General
         let mut general = Page::new(mtm);
         general.heading("Appearance");
-        let layout = general.segmented(
+        general.begin_card();
+        let layout = general.choice(
             "Layout",
+            None,
             &[Layout::Regular.label(), Layout::Compact.label()],
             Act::SettingsLayout,
         );
-        let meters = general.segmented(
+        let meters = general.choice(
             "Meters",
+            None,
             &[MeterStyle::Bars.label(), MeterStyle::Rings.label()],
             Act::SettingsMeters,
         );
-        general.gap(2.0);
-        let spend = general.checkbox("Show spend under the meters", Act::ToggleSpend, 0);
-        let linear = general.checkbox(
+        let spend = general.toggle("Show spend under the meters", Act::ToggleSpend, 0);
+        let linear = general.toggle(
             "Show the Linear ticket a branch is named for",
             Act::ToggleLinear,
             0,
         );
-        general.gap(10.0);
+        general.end_card();
 
         general.heading("Menu bar icon");
-        let bar_window = general.segmented(
+        general.begin_card();
+        let bar_window = general.choice(
             "Meter",
+            None,
             &strs(&labels_of(&BarWindow::ALL, |w| w.label().to_owned())),
             Act::SettingsBarWindow,
         );
-        general.gap(2.0);
-        let bar_badge =
-            general.checkbox("Show what the sessions are doing", Act::ToggleBarBadge, 0);
-        general.gap(10.0);
+        let bar_badge = general.toggle("Show what the sessions are doing", Act::ToggleBarBadge, 0);
+        general.end_card();
 
         general.heading("Refresh");
+        general.begin_card();
         // The sessions are read when their records change. Usage too, but no
         // more often than chosen here; only GitHub has to be asked.
         let every = |page: &mut Page, name: &str, choices: &[u64], act: Act| {
-            page.segmented(
+            page.choice(
                 name,
+                None,
                 &strs(&labels_of(choices, view_prefs::secs_label)),
                 act,
             )
@@ -242,20 +397,22 @@ impl SettingsWindow {
             &view_prefs::PR_EVERY,
             Act::SettingsPr,
         );
-        general.gap(10.0);
+        general.end_card();
 
         let awake = awake_enabled.then(|| {
             general.heading("Keep awake");
-            let auto = general.checkbox(
+            general.begin_card();
+            let auto = general.toggle(
                 "Auto caffeinate while a session is working",
                 Act::ToggleAutoAwake,
                 0,
             );
-            let rc = general.checkbox(
+            let rc = general.toggle(
                 "Keep the Mac awake for sessions with /rc on",
                 Act::ToggleRcAwake,
                 0,
             );
+            general.end_card();
             (auto, rc)
         });
         let (auto, rc) = awake.map_or((None, None), |(auto, rc)| (Some(auto), Some(rc)));
@@ -263,110 +420,234 @@ impl SettingsWindow {
         // ---- Sessions
         let mut list = Page::new(mtm);
         list.heading("List");
-        let sort = list.segmented(
+        list.begin_card();
+        let sort = list.choice(
             "Sort by",
+            Some("Within a group. Needs you, Working, Idle and Cold stay in that order."),
             &strs(&labels_of(&SortOrder::ALL, |o| o.label().to_owned())),
             Act::SettingsSort,
         );
-        list.note("Within a group. Needs you, Working, Idle and Cold stay in that order.");
-        let cold = list.segmented(
+        let cold = list.choice(
             "Cold",
+            Some("Sessions whose cache has expired. In the popover they are left out of All and the Cold filter lists them."),
             &strs(&labels_of(&ColdMode::ALL, |m| m.label().to_owned())),
             Act::SettingsCold,
         );
-        list.note("Sessions whose cache has expired. In the popover they are left out of All and the Cold filter lists them.");
-        let max_sessions = list.segmented(
+        let (max_sessions, max_sessions_label) = list.range(
             "Show up to",
-            &strs(&labels_of(&view_prefs::MAX_SESSION_CHOICES, |n| {
-                n.to_string()
-            })),
+            view_prefs::MAX_SESSION_CHOICES.len(),
             Act::SettingsMaxSessions,
         );
-        let density = list.segmented(
+        let density = list.choice(
             "Cards",
+            None,
             &strs(&labels_of(&Density::ALL, |d| d.label().to_owned())),
             Act::SettingsDensity,
         );
-        list.gap(10.0);
+        list.end_card();
 
         list.heading("Flags");
-        let needs_you = list.segmented(
+        list.begin_card();
+        let needs_you = list.choice(
             "Needs you",
+            Some("An idle session whose cache has this long or less left."),
             &strs(&labels_of(&view_prefs::NEEDS_YOU_MINS, |m| {
                 format!("{m} min")
             })),
             Act::SettingsNeedsYou,
         );
-        list.note("An idle session whose cache has this long or less left.");
-        let cache_lead = list.segmented(
+        let cache_lead = list.choice(
             "Warn",
+            Some("How long before a one-hour cache expires to notify. A five-minute cache is warned one minute before."),
             &strs(&labels_of(&view_prefs::CACHE_LEAD_MINS, |m| {
                 format!("{m} min")
             })),
             Act::SettingsCacheLead,
         );
-        list.note("How long before a one-hour cache expires to notify. A five-minute cache is warned one minute before.");
-        let ring = list.segmented(
+        let ring = list.choice(
             "Context ring",
+            Some("Where it turns orange, then red. The status line's own warning stays at 85 %."),
             &strs(&labels_of(&view_prefs::RING_POINTS, |(note, warn)| {
                 format!("{note} / {warn} %")
             })),
             Act::SettingsRing,
         );
-        list.note("Where it turns orange, then red. The status line's own warning stays at 85 %.");
+        list.end_card();
 
         // ---- Notifications
         let mut alerts = Page::new(mtm);
         alerts.heading("Notify me when");
+        alerts.begin_card();
         let notify = NOTIFY_KINDS
             .iter()
             .enumerate()
             .map(|(i, (_, label, _))| {
-                alerts.checkbox(
+                alerts.toggle(
                     label,
                     Act::ToggleNotify,
                     isize::try_from(i).unwrap_or(isize::MAX),
                 )
             })
             .collect();
+        alerts.end_card();
 
         let height = [general.finish(), list.finish(), alerts.finish()]
             .into_iter()
             .fold(0.0, f64::max);
         let tabs = NSTabView::initWithFrame(
             NSTabView::alloc(mtm),
-            NSRect::new(
-                NSPoint::new(0.0, 0.0),
-                NSSize::new(WIDTH, height + TAB_CHROME),
-            ),
+            NSRect::new(NSPoint::new(0.0, TOP_BAR), NSSize::new(WIDTH, height)),
         );
-        for (name, page) in [
-            ("General", general),
-            ("Sessions", list),
-            ("Notifications", alerts),
-        ] {
-            page.content
-                .setFrameSize(NSSize::new(WIDTH - 2.0 * 12.0, height));
+        tabs.setTabViewType(NSTabViewType::NoTabsNoBorder);
+        let pages = [
+            ("General", "gearshape", general),
+            ("Sessions", "rectangle.stack", list),
+            ("Notifications", "bell", alerts),
+        ];
+        let mut sidebar = Vec::new();
+        for (name, symbol, page) in pages {
+            page.content.setFrameSize(NSSize::new(PAGE_WIDTH, height));
             let item = sl_macos::system::tab_view_item();
             item.setLabel(&NSString::from_str(name));
             item.setView(Some(&page.content));
             tabs.addTabViewItem(&item);
+            sidebar.push((name, symbol));
         }
+
+        let total = height + TOP_BAR;
+        // The sidebar's rows and the page, each the view of one split item: the
+        // split view controller gives the sidebar its system material.
+        let side = FlippedView::new(
+            mtm,
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(SIDEBAR_WIDTH, total)),
+        );
+        let main = FlippedView::new(
+            mtm,
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WIDTH, total)),
+        );
+        // The page's name, in the top bar, level with the traffic lights.
+        let title = NSTextField::labelWithString(&NSString::from_str("General"), mtm);
+        title.setFont(Some(&NSFont::systemFontOfSize_weight(
+            15.0,
+            sl_macos::consts::font_weight(sl_macos::consts::Weight::Semibold),
+        )));
+        title.setFrame(NSRect::new(
+            NSPoint::new(CARD_X + 4.0, 16.0),
+            NSSize::new(WIDTH - 2.0 * CARD_X, 20.0),
+        ));
+        main.addSubview(&title);
+        // The selected row's pill sits under its button.
+        let pill = rounded_box(mtm, 10.0, &NSColor::controlAccentColor());
+        side.addSubview(&pill);
+        let tile_colors = [
+            NSColor::systemGrayColor(),
+            NSColor::systemBlueColor(),
+            NSColor::systemRedColor(),
+        ];
+        let buttons: Vec<Retained<NSButton>> = sidebar
+            .iter()
+            .enumerate()
+            .map(|(i, (name, symbol))| {
+                let row_y = TOP_BAR + SIDEBAR_ROW * i as f64;
+                // The icon: a coloured tile with a white symbol, under the button.
+                let tile = rounded_box(mtm, 5.0, &tile_colors[i % tile_colors.len()]);
+                tile.setFrame(NSRect::new(
+                    NSPoint::new(SIDEBAR_INSET + 9.0, row_y + (SIDEBAR_ROW - 20.0) / 2.0),
+                    NSSize::new(20.0, 20.0),
+                ));
+                side.addSubview(&tile);
+                if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                    &NSString::from_str(symbol),
+                    None,
+                ) {
+                    let glyph = NSImageView::imageViewWithImage(&image, mtm);
+                    glyph.setContentTintColor(Some(&NSColor::whiteColor()));
+                    glyph.setFrame(NSRect::new(
+                        NSPoint::new(SIDEBAR_INSET + 12.5, row_y + (SIDEBAR_ROW - 13.0) / 2.0),
+                        NSSize::new(13.0, 13.0),
+                    ));
+                    side.addSubview(&glyph);
+                }
+                // The whole row is the button; its title is indented past the icon.
+                let button = sl_macos::controls::button(mtm, name);
+                button.setBordered(false);
+                button.setAlignment(NSTextAlignment::Left);
+                button.setFrame(NSRect::new(
+                    NSPoint::new(SIDEBAR_INSET, row_y),
+                    NSSize::new(SIDEBAR_WIDTH - 2.0 * SIDEBAR_INSET, SIDEBAR_ROW),
+                ));
+                side.addSubview(&button);
+                button
+            })
+            .collect();
+        main.addSubview(&tabs);
+        let show_page: Rc<dyn Fn(usize)> = {
+            let tabs = tabs.clone();
+            let buttons = buttons.clone();
+            let pill = pill.clone();
+            let title = title.clone();
+            let names: Vec<&str> = sidebar.iter().map(|(name, _)| *name).collect();
+            Rc::new(move |index| {
+                title.setStringValue(&NSString::from_str(names.get(index).copied().unwrap_or("")));
+                tabs.selectTabViewItemAtIndex(isize::try_from(index).unwrap_or(0));
+                for (i, button) in buttons.iter().enumerate() {
+                    if i == index {
+                        pill.setFrame(button.frame());
+                    }
+                    button.setAttributedTitle(&sidebar_title(
+                        names.get(i).copied().unwrap_or(""),
+                        i == index,
+                    ));
+                }
+            })
+        };
+        for (i, button) in buttons.iter().enumerate() {
+            let show = Rc::clone(&show_page);
+            sl_macos::action::bind(button, move |_| show(i));
+        }
+        show_page(0);
 
         let frame = NSRect::new(
             NSPoint::new(0.0, 0.0),
-            NSSize::new(WIDTH, height + TAB_CHROME),
+            NSSize::new(SIDEBAR_WIDTH + WIDTH, height + TOP_BAR),
         );
         let window = sl_macos::window::new_window(
             mtm,
             frame,
-            NSWindowStyleMask::Titled | NSWindowStyleMask::Closable,
+            NSWindowStyleMask::Titled
+                | NSWindowStyleMask::Closable
+                | NSWindowStyleMask::FullSizeContentView,
         );
         window.setTitle(&NSString::from_str("Statusline Tray Settings"));
-        window.setContentView(Some(&tabs));
+        // An empty toolbar: it is what gives the title bar the taller System
+        // Settings height, with the traffic lights centred in it.
+        let toolbar = NSToolbar::initWithIdentifier(
+            NSToolbar::alloc(mtm),
+            &NSString::from_str("statusline-tray-settings"),
+        );
+        window.setToolbar(Some(&toolbar));
+        window.setToolbarStyle(NSWindowToolbarStyle::Unified);
+        window.setTitlebarAppearsTransparent(true);
+        window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
+        let side_controller = NSViewController::new(mtm);
+        side_controller.setView(&side);
+        let main_controller = NSViewController::new(mtm);
+        main_controller.setView(&main);
+        let split = NSSplitViewController::new(mtm);
+        let side_item = NSSplitViewItem::sidebarWithViewController(&side_controller);
+        side_item.setMinimumThickness(SIDEBAR_WIDTH);
+        side_item.setMaximumThickness(SIDEBAR_WIDTH);
+        side_item.setCanCollapse(false);
+        let main_item = NSSplitViewItem::splitViewItemWithViewController(&main_controller);
+        main_item.setMinimumThickness(WIDTH);
+        split.addSplitViewItem(&side_item);
+        split.addSplitViewItem(&main_item);
+        window.setContentViewController(Some(&split));
+        window.setContentSize(NSSize::new(SIDEBAR_WIDTH + WIDTH, total));
         window.center();
         Self {
             window,
+            show_page,
             layout,
             meters,
             spend,
@@ -380,6 +661,7 @@ impl SettingsWindow {
             sort,
             cold,
             max_sessions,
+            max_sessions_label,
             density,
             needs_you,
             cache_lead,
@@ -414,9 +696,9 @@ impl SettingsWindow {
         let index =
             |found: Option<usize>| isize::try_from(found.unwrap_or(0)).unwrap_or(isize::MAX);
         self.layout
-            .setSelectedSegment(index(Layout::ALL.iter().position(|l| l == layout)));
+            .selectItemAtIndex(index(Layout::ALL.iter().position(|l| l == layout)));
         self.meters
-            .setSelectedSegment(index(MeterStyle::ALL.iter().position(|m| m == meters)));
+            .selectItemAtIndex(index(MeterStyle::ALL.iter().position(|m| m == meters)));
         let mark = |on: bool| {
             if on {
                 NSControlStateValueOn
@@ -428,12 +710,12 @@ impl SettingsWindow {
         self.linear.setState(mark(view_prefs::load_switch(
             view_prefs::Switch::ShowLinear,
         )));
-        self.bar_window.setSelectedSegment(index(
+        self.bar_window.selectItemAtIndex(index(
             BarWindow::ALL.iter().position(|w| *w == tuning.bar_window),
         ));
         self.bar_badge.setState(mark(tuning.bar_badge));
-        let select = |control: &NSSegmentedControl, choices: &[u64], secs: u64| {
-            control.setSelectedSegment(index(choices.iter().position(|c| *c == secs)));
+        let select = |control: &NSPopUpButton, choices: &[u64], secs: u64| {
+            control.selectItemAtIndex(index(choices.iter().position(|c| *c == secs)));
         };
         select(&self.usage, &view_prefs::USAGE_EVERY, poll.usage_secs);
         select(&self.pr, &view_prefs::PR_EVERY, poll.pr_secs);
@@ -446,18 +728,20 @@ impl SettingsWindow {
             )));
         }
         self.sort
-            .setSelectedSegment(index(SortOrder::ALL.iter().position(|o| *o == tuning.sort)));
-        self.cold.setSelectedSegment(index(
+            .selectItemAtIndex(index(SortOrder::ALL.iter().position(|o| *o == tuning.sort)));
+        self.cold.selectItemAtIndex(index(
             ColdMode::ALL
                 .iter()
                 .position(|m| *m == tuning.cold_mode(*layout)),
         ));
-        select(
-            &self.max_sessions,
-            &view_prefs::MAX_SESSION_CHOICES,
-            tuning.max_sessions as u64,
-        );
-        self.density.setSelectedSegment(index(
+        let position = view_prefs::MAX_SESSION_CHOICES
+            .iter()
+            .position(|c| *c == tuning.max_sessions as u64);
+        self.max_sessions
+            .setDoubleValue(f64::from(u32::try_from(position.unwrap_or(0)).unwrap_or(0)));
+        self.max_sessions_label
+            .setStringValue(&NSString::from_str(&tuning.max_sessions.to_string()));
+        self.density.selectItemAtIndex(index(
             Density::ALL.iter().position(|d| *d == tuning.density),
         ));
         select(
@@ -470,7 +754,7 @@ impl SettingsWindow {
             &view_prefs::CACHE_LEAD_MINS,
             tuning.cache_lead_mins,
         );
-        self.ring.setSelectedSegment(index(
+        self.ring.selectItemAtIndex(index(
             view_prefs::RING_POINTS
                 .iter()
                 .position(|(note, warn)| *note == tuning.ring_note && *warn == tuning.ring_warn),
@@ -512,15 +796,12 @@ pub(crate) fn preview(path: &str) -> bool {
     let backdrop_view: &NSView = &backdrop;
     objc2_app_kit::NSAppearanceCustomization::setAppearance(backdrop_view, dark.as_deref());
     backdrop.addSubview(&content);
-    let Ok(tabs) = content.downcast::<NSTabView>() else {
-        return false;
-    };
     let stem = path.strip_suffix(".png").unwrap_or(path);
     ["general", "sessions", "notifications"]
         .iter()
         .enumerate()
         .all(|(i, name)| {
-            tabs.selectTabViewItemAtIndex(isize::try_from(i).unwrap_or(isize::MAX));
+            (settings.show_page)(i);
             crate::controller::write_png(&backdrop, &format!("{stem}-{name}.png"))
         })
 }
