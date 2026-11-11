@@ -44,6 +44,7 @@ fn base_inputs() -> RenderInputs {
         branch: Some("main".to_string()),
         auto_compact_window: None,
         gh: None,
+        agent_name: None,
         options: RenderOptions::default(),
     }
 }
@@ -120,6 +121,7 @@ fn missing_pieces_drop_their_segments_instead_of_crashing() {
         branch: None,
         auto_compact_window: None,
         gh: None,
+        agent_name: None,
         options: RenderOptions::default(),
     };
     assert_eq!(plain(&parse("{}"), &empty_inputs), "");
@@ -468,4 +470,13 @@ fn a_failed_jobs_name_and_link_cannot_write_escape_sequences() {
 fn render_leaves_a_margin_below_columns() {
     let out = strip_ansi(&render(&base_payload(), &base_inputs(), Some(100)));
     assert!(out.lines().all(|l| l.chars().count() <= 96), "{out}");
+}
+
+#[test]
+fn agent_segment_shows_the_session_name_and_hides_on_request() {
+    let mut inputs = base_inputs();
+    inputs.agent_name = Some("statusline-2a".to_string());
+    assert!(plain(&base_payload(), &inputs).contains("statusline-2a"));
+    inputs.options.hidden = vec!["agent".to_string()];
+    assert!(!plain(&base_payload(), &inputs).contains("statusline-2a"));
 }

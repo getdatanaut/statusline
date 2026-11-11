@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+pub mod agent;
 pub mod context;
 pub mod limits;
 pub mod render;

@@ -19,6 +19,8 @@ pub struct RenderInputs {
     pub branch: Option<String>,
     pub auto_compact_window: Option<i64>,
     pub gh: Option<GhInfo>,
+    /// The name other sessions message this one by, see `agent`.
+    pub agent_name: Option<String>,
     pub options: RenderOptions,
 }
 
@@ -26,7 +28,7 @@ pub struct RenderInputs {
 #[derive(Clone, Default)]
 pub struct RenderOptions {
     /// Segment names from `--hide`: session, weekly, context, cache, cost,
-    /// model, tools, api, lines, branch.
+    /// model, agent, tools, api, lines, branch.
     pub hidden: Vec<String>,
     /// `$USER`, whose `user/` branch prefix is left off.
     pub user: Option<String>,
@@ -271,6 +273,12 @@ pub fn render_segments(payload: &StatusPayload, inputs: &RenderInputs) -> Vec<St
             colored(&model, WHITE),
             effort_marker(payload)
         ));
+    }
+
+    if inputs.shows("agent")
+        && let Some(name) = inputs.agent_name.as_deref()
+    {
+        parts.push(colored(name, CYAN));
     }
 
     if inputs.shows("tools")

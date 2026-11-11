@@ -81,6 +81,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
 
+    let agent_name = payload
+        .session_id
+        .as_deref()
+        .and_then(|id| statusline::agent::session_name(&home, id));
+
     let options = RenderOptions {
         hidden: flag(&args, "--hide")
             .map(|names| names.split(',').map(|s| s.trim().to_string()).collect())
@@ -95,6 +100,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         branch,
         auto_compact_window,
         gh,
+        agent_name,
         options,
     };
     println!("{}", render(&payload, &inputs, columns));

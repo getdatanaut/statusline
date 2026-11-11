@@ -106,7 +106,7 @@ cargo install --path crates/statusline   # -> ~/.cargo/bin/statusline
 Both commands need an absolute path (`~` is not expanded).
 To drop segments, pass their names to `--hide`, e.g.
 `statusline --hide cache,api,tools,lines`. Names: `session`, `weekly`,
-`context`, `cache`, `cost`, `model`, `tools`, `api`, `lines`, `branch`.
+`context`, `cache`, `cost`, `model`, `agent`, `tools`, `api`, `lines`, `branch`.
 `--linear-workspace datanaut` links ticket labels to
 `linear.app/datanaut/issue/<id>`.
 `refreshInterval` re-renders every 30s so reset countdowns stay current while
