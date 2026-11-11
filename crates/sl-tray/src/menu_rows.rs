@@ -979,6 +979,8 @@ impl HeaderView {
     /// menu is open.
     pub(crate) fn set(&self, content: HeaderContent) {
         const RIGHT: f64 = 14.0;
+        // Between two pills.
+        const GAP: f64 = 6.0;
         if self.ivars().content.borrow().as_ref() == Some(&content) {
             return;
         }
@@ -995,14 +997,19 @@ impl HeaderView {
             && let Some(image) =
                 crate::controller::symbol_image_sized_pub(symbol, &tone_color(tone), 12.5)
         {
+            // A symbol draws a little past its nominal size (the branch's
+            // arrowhead does): a view of exactly that size clips it, so the
+            // view is padded and the image, unscaled, centred in it.
+            const PAD: f64 = 3.0;
             let view = objc2_app_kit::NSImageView::imageViewWithImage(&image, mtm);
+            view.setImageScaling(objc2_app_kit::NSImageScaling::ScaleNone);
             let size = image.size();
             view.setFrame(NSRect::new(
                 NSPoint::new(
-                    (ACTION_ICON_X - size.width / 2.0).round(),
-                    y + ((first_height - size.height) / 2.0).round(),
+                    (ACTION_ICON_X - size.width / 2.0).round() - PAD,
+                    y + ((first_height - size.height) / 2.0).round() - PAD,
                 ),
-                size,
+                NSSize::new(size.width + 2.0 * PAD, size.height + 2.0 * PAD),
             ));
             self.addSubview(&view);
         }
@@ -1022,17 +1029,47 @@ impl HeaderView {
         ));
         self.addSubview(&title);
         x += title.frame().size.width + 8.0;
-        for pill in &content.pills {
-            let view = crate::compact::tinted_pill(mtm, pill, true);
-            view.setFrameOrigin(NSPoint::new(x, y));
-            self.addSubview(&view);
-            x += view.frame().size.width + 6.0;
-        }
-        if let Some(pill) = &content.end_pill {
-            let view = crate::compact::tinted_pill(mtm, pill, true);
-            view.setFrameOrigin(NSPoint::new(width - RIGHT - view.frame().size.width, y));
-            view.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
-            self.addSubview(&view);
+        let pills: Vec<_> = content
+            .pills
+            .iter()
+            .map(|pill| crate::compact::tinted_pill(mtm, pill, true))
+            .collect();
+        let end = content
+            .end_pill
+            .as_ref()
+            .map(|pill| crate::compact::tinted_pill(mtm, pill, true));
+        let widths: f64 = pills.iter().map(|v| v.frame().size.width + GAP).sum();
+        let end_width = end.as_ref().map_or(0.0, |v| v.frame().size.width);
+        let edge = width - RIGHT;
+        if x + widths + end_width <= edge {
+            // All beside the title, the last against the right edge.
+            for view in &pills {
+                view.setFrameOrigin(NSPoint::new(x, y));
+                self.addSubview(view);
+                x += view.frame().size.width + GAP;
+            }
+            if let Some(view) = &end {
+                view.setFrameOrigin(NSPoint::new(edge - end_width, y));
+                view.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
+                self.addSubview(view);
+            }
+        } else {
+            // Under the title, one after another, a pill that does not fit
+            // starting a row of its own: none drawn over another or past
+            // the edge.
+            let row = first_height + 4.0;
+            y += row;
+            x = ACTION_TEXT_X;
+            for view in pills.iter().chain(&end) {
+                let w = view.frame().size.width;
+                if x > ACTION_TEXT_X && x + w > edge {
+                    y += row;
+                    x = ACTION_TEXT_X;
+                }
+                view.setFrameOrigin(NSPoint::new(x, y));
+                self.addSubview(view);
+                x += w + GAP;
+            }
         }
         y += first_height + 5.0;
         let regular = sl_macos::consts::font_weight(sl_macos::consts::Weight::Regular);
