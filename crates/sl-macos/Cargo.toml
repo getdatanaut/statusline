@@ -110,7 +110,17 @@ features = [
     "NSGraphicsContext",
     "NSParagraphStyle",
     "NSSegmentedControl",
-    # The Settings window's tabs.
+    # The Settings window: tabs, grouped cards, switches and pop-up menus.
+    "NSBox",
+    "NSPopUpButton",
+    "NSVisualEffectView",
+    "NSSplitView",
+    "NSSplitViewController",
+    "NSSplitViewItem",
+    "NSSlider",
+    "NSSliderCell",
+    "NSSwitch",
+    "NSAccessibilityProtocols",
     "NSTabView",
     "NSTabViewItem",
     "NSShadow",

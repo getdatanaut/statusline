@@ -15,7 +15,10 @@ use std::rc::Rc;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
-use objc2_app_kit::{NSButton, NSControl, NSControlStateValueOn, NSMenuItem, NSSegmentedControl};
+use objc2_app_kit::{
+    NSButton, NSControl, NSControlStateValueOn, NSMenuItem, NSPopUpButton, NSSegmentedControl,
+    NSSlider, NSSwitch,
+};
 use objc2_foundation::NSObjectProtocol;
 
 /// What a bound control runs when it fires: given the sender.
@@ -128,15 +131,34 @@ pub fn tag(sender: &AnyObject) -> isize {
         .map_or(0, NSMenuItem::tag)
 }
 
-/// A segmented control sender's selected segment; -1 for anything else.
+/// A segmented control's selected segment, or a pop-up menu's chosen item;
+/// -1 for any other sender.
 pub fn selected_segment(sender: &AnyObject) -> isize {
+    if let Some(popup) = sender.downcast_ref::<NSPopUpButton>() {
+        return popup.indexOfSelectedItem();
+    }
     sender
         .downcast_ref::<NSSegmentedControl>()
         .map_or(-1, NSSegmentedControl::selectedSegment)
 }
 
-/// Whether a button sender is on (a checked checkbox); false for anything else.
+/// A slider sender's position, rounded; -1 for anything else.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a slider's range is small whole numbers"
+)]
+pub fn slider_value(sender: &AnyObject) -> i64 {
+    sender
+        .downcast_ref::<NSSlider>()
+        .map_or(-1, |slider| slider.doubleValue().round() as i64)
+}
+
+/// Whether a switch or button sender is on (a checked checkbox); false for
+/// anything else.
 pub fn is_on(sender: &AnyObject) -> bool {
+    if let Some(switch) = sender.downcast_ref::<NSSwitch>() {
+        return switch.state() == NSControlStateValueOn;
+    }
     sender
         .downcast_ref::<NSButton>()
         .is_some_and(|button| button.state() == NSControlStateValueOn)

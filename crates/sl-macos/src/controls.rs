@@ -3,8 +3,11 @@
 
 use objc2::MainThreadMarker;
 use objc2::rc::Retained;
-use objc2_app_kit::{NSButton, NSImage, NSSegmentSwitchTracking, NSSegmentedControl};
-use objc2_foundation::{NSArray, NSString};
+use objc2_app_kit::{
+    NSButton, NSImage, NSPopUpButton, NSSegmentSwitchTracking, NSSegmentedControl, NSSlider,
+    NSSwitch,
+};
+use objc2_foundation::{NSArray, NSRect, NSString};
 
 /// A push button titled `title`.
 pub fn button(mtm: MainThreadMarker, title: &str) -> Retained<NSButton> {
@@ -54,4 +57,37 @@ pub fn segmented(mtm: MainThreadMarker, labels: &[&str]) -> Retained<NSSegmented
             mtm,
         )
     }
+}
+
+/// An on/off switch, as System Settings has them.
+pub fn switch(mtm: MainThreadMarker) -> Retained<NSSwitch> {
+    NSSwitch::new(mtm)
+}
+
+/// A pop-up menu of `labels`, one chosen at a time.
+pub fn popup(mtm: MainThreadMarker, labels: &[&str]) -> Retained<NSPopUpButton> {
+    let popup = NSPopUpButton::initWithFrame_pullsDown(mtm.alloc(), NSRect::ZERO, false);
+    for label in labels {
+        popup.addItemWithTitle(&NSString::from_str(label));
+    }
+    popup
+}
+
+/// A slider over `0..positions`, one tick for each position.
+pub fn slider(mtm: MainThreadMarker, positions: usize) -> Retained<NSSlider> {
+    let last = positions.saturating_sub(1);
+    // SAFETY: as in `button`.
+    let slider = unsafe {
+        NSSlider::sliderWithValue_minValue_maxValue_target_action(
+            0.0,
+            0.0,
+            f64::from(u32::try_from(last).unwrap_or(0)),
+            None,
+            None,
+            mtm,
+        )
+    };
+    slider.setNumberOfTickMarks(isize::try_from(positions).unwrap_or(0));
+    slider.setAllowsTickMarkValuesOnly(true);
+    slider
 }
