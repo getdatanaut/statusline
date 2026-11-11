@@ -1386,6 +1386,22 @@ fn pill_view(mtm: MainThreadMarker, pill: &Pill) -> TintView {
     tinted_pill(mtm, pill, false)
 }
 
+/// A pill's text: its tone in the shared palette, lifted toward the
+/// background's opposite (lighter in dark mode, darker in light) so it reads
+/// clearly over its own tint, which is the same colour.
+fn pill_text_color(mtm: MainThreadMarker, tone: Tone) -> Retained<NSColor> {
+    let base = crate::controller::meter_color(tone);
+    let dark =
+        sl_macos::consts::is_dark(&NSApplication::sharedApplication(mtm).effectiveAppearance());
+    let (toward, fraction) = if dark {
+        (NSColor::whiteColor(), 0.35)
+    } else {
+        (NSColor::blackColor(), 0.2)
+    };
+    base.blendedColorWithFraction_ofColor(fraction, &toward)
+        .unwrap_or(base)
+}
+
 /// A pill as a view. `coloured_text`: the text in the pill's own colour, as
 /// the menus have it; otherwise in the label colour.
 pub(crate) fn tinted_pill(mtm: MainThreadMarker, pill: &Pill, coloured_text: bool) -> TintView {
@@ -1393,9 +1409,9 @@ pub(crate) fn tinted_pill(mtm: MainThreadMarker, pill: &Pill, coloured_text: boo
     view.ivars().radius.set(PILL_HEIGHT / 2.0);
     view.ivars()
         .strength
-        .set(if coloured_text { 0.16 } else { 0.22 });
+        .set(if coloured_text { 0.26 } else { 0.22 });
     let colour = if coloured_text && !matches!(pill.tone, Tone::Plain | Tone::Dim) {
-        crate::controller::meter_color(pill.tone)
+        pill_text_color(mtm, pill.tone)
     } else {
         NSColor::labelColor()
     };
