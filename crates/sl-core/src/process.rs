@@ -5,8 +5,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// `PATH` with the usual tool locations in front: a program started outside a
-/// shell (the tray, as a login item) has a bare `PATH`, and `gh`, `linear`
-/// and `zed` live in Homebrew's.
+/// shell (the tray, as a login item) has a bare `PATH`, and `gh` and `zed`
+/// live in Homebrew's.
 pub fn tool_path() -> String {
     let home = dirs::home_dir().unwrap_or_default();
     let mut dirs: Vec<String> = vec![

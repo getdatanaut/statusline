@@ -43,9 +43,9 @@ pub(crate) enum Effect {
         body: String,
     },
     Caffeinate(bool),
-    /// Storing a GitHub token (never shown), or removing it.
-    SaveToken,
-    RemoveToken,
+    /// Storing a GitHub token or Linear key (never shown), or removing it.
+    SaveSecret(crate::integrations::Service),
+    RemoveSecret(crate::integrations::Service),
     Quit,
 }
 
@@ -71,8 +71,12 @@ impl std::fmt::Display for Effect {
             Effect::Popup(title) => write!(f, "popup {title:?}"),
             Effect::Notify { title, body } => write!(f, "notify {title:?}: {body:?}"),
             Effect::Caffeinate(on) => write!(f, "caffeinate {}", if *on { "on" } else { "off" }),
-            Effect::SaveToken => write!(f, "save GitHub token"),
-            Effect::RemoveToken => write!(f, "remove GitHub token"),
+            Effect::SaveSecret(service) => {
+                write!(f, "save {} {}", service.name(), service.secret())
+            }
+            Effect::RemoveSecret(service) => {
+                write!(f, "remove {} {}", service.name(), service.secret())
+            }
             Effect::Quit => write!(f, "quit"),
         }
     }
@@ -88,8 +92,8 @@ static RECORDER: OnceLock<Recorder> = OnceLock::new();
 
 /// From now on, write every effect down instead of performing it, and answer
 /// every confirm dialog with `confirm`. For the self-test; there is no way back.
-/// GitHub goes offline too: the Keychain and curl are at fixed paths the
-/// self-test's stubbed `PATH` cannot catch.
+/// GitHub and Linear go offline too: the Keychain and curl are at fixed
+/// paths the self-test's stubbed `PATH` cannot catch.
 pub(crate) fn record(confirm: bool) {
     sl_core::gh::api::go_offline();
     let recorder = RECORDER.get_or_init(|| Recorder {

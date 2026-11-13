@@ -1,28 +1,138 @@
-//! Settings → Integrations: the GitHub token, stored in the Keychain.
+//! Settings → Integrations: the GitHub token and the Linear API key, each
+//! stored in its own Keychain item.
 //!
-//! Saving checks the token with GitHub first (it must name a login), then
-//! stores it; removing deletes it. Both run off the main thread, and say how
-//! it went through [`github`], which the Settings window shows.
+//! Saving checks the secret with its service first (it must name an account),
+//! then stores it; removing deletes it. Both run off the main thread, and say
+//! how it went through [`standing`], which the Settings window shows.
 //!
 //! While it holds a token GitHub accepts, the tray says so every minute in
 //! the store ([`spawn_heartbeat`]): the status line then leaves GitHub to it.
-//! A token GitHub starts refusing (expired, revoked) is reported once, by a
-//! notification, and in Settings and the menu.
+//! A secret its service starts refusing (expired, revoked) is reported once,
+//! by a notification, and in Settings.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use sl_core::gh::{self, api::Failure};
+use sl_core::gh;
 
-/// GitHub's page for a new classic token, with the scopes the tray needs
-/// (`repo`: PRs, reviews, CI, stacks, logs, re-runs; `read:org`: teams asked
-/// to review) ticked and its note filled in.
-pub(crate) const NEW_TOKEN_URL: &str =
-    "https://github.com/settings/tokens/new?scopes=repo,read:org&description=Statusline%20Tray";
+/// What Settings → Integrations has a section for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Service {
+    GitHub,
+    Linear,
+}
 
-/// Where the GitHub token stands.
+/// Why an account could not be named.
+enum Failure {
+    /// Nothing is stored.
+    Missing,
+    /// The service refused what is stored.
+    Refused,
+    Other(String),
+}
+
+impl From<gh::api::Failure> for Failure {
+    fn from(failure: gh::api::Failure) -> Self {
+        match failure {
+            gh::api::Failure::Unauthorized => Failure::Refused,
+            gh::api::Failure::NoToken(why) if why == gh::api::NO_TOKEN => Failure::Missing,
+            other => Failure::Other(other.to_string()),
+        }
+    }
+}
+
+impl From<crate::linear::Failure> for Failure {
+    fn from(failure: crate::linear::Failure) -> Self {
+        match failure {
+            crate::linear::Failure::Refused => Failure::Refused,
+            crate::linear::Failure::NoKey(why) if why == crate::linear::NO_KEY => Failure::Missing,
+            other => Failure::Other(other.to_string()),
+        }
+    }
+}
+
+impl Service {
+    const ALL: [Service; 2] = [Service::GitHub, Service::Linear];
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Service::GitHub => "GitHub",
+            Service::Linear => "Linear",
+        }
+    }
+
+    /// What the service calls the secret.
+    pub(crate) fn secret(self) -> &'static str {
+        match self {
+            Service::GitHub => "token",
+            Service::Linear => "key",
+        }
+    }
+
+    /// Where a new secret is made. GitHub's page comes with the scopes the
+    /// tray needs (`repo`: PRs, reviews, CI, stacks, logs, re-runs;
+    /// `read:org`: teams asked to review) ticked and its note filled in;
+    /// Linear's cannot be filled in.
+    pub(crate) fn new_secret_url(self) -> &'static str {
+        match self {
+            Service::GitHub => {
+                "https://github.com/settings/tokens/new?scopes=repo,read:org&description=Statusline%20Tray"
+            }
+            Service::Linear => crate::linear::NEW_KEY_URL,
+        }
+    }
+
+    fn item(self) -> crate::keychain::Item {
+        match self {
+            Service::GitHub => crate::keychain::GITHUB,
+            Service::Linear => crate::keychain::LINEAR,
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Service::GitHub => 0,
+            Service::Linear => 1,
+        }
+    }
+
+    /// Whose `secret` is, asked of the service.
+    fn account_of(self, secret: &str) -> Result<String, Failure> {
+        Ok(match self {
+            Service::GitHub => gh::api::login_of(secret)?,
+            Service::Linear => crate::linear::account_of(secret)?,
+        })
+    }
+
+    /// Whose the stored secret is.
+    fn account(self) -> Result<String, Failure> {
+        Ok(match self {
+            Service::GitHub => gh::api::login()?,
+            Service::Linear => crate::linear::account()?,
+        })
+    }
+
+    /// After the secret changed: forget the old one, and ask again about
+    /// everything it was asked about. For GitHub, lift the holds failures
+    /// left too.
+    fn changed(self) {
+        match self {
+            Service::GitHub => {
+                gh::api::token_replaced();
+                if let Some(store) = gh::Store::open_default() {
+                    store.release_failed();
+                }
+                beat();
+            }
+            Service::Linear => crate::linear::key_replaced(),
+        }
+        crate::sessions::looked();
+    }
+}
+
+/// Where a service's secret stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum GitHub {
+pub(crate) enum Standing {
     /// Not looked at yet.
     Unknown,
     /// Being read, checked or stored.
@@ -30,79 +140,89 @@ pub(crate) enum GitHub {
     /// None stored.
     Missing,
     SignedIn(String),
-    /// Stored, and refused by GitHub.
+    /// Stored, and refused by the service.
     Refused,
     /// Something else went wrong; the text says what.
     Failed(String),
 }
 
-impl GitHub {
-    /// As the Settings window says it.
-    pub(crate) fn text(&self) -> String {
+impl Standing {
+    /// As the Settings window says it, of `service`.
+    pub(crate) fn text(&self, service: Service) -> String {
         match self {
-            GitHub::Unknown | GitHub::Working => "Checking…".to_owned(),
-            GitHub::Missing => "No token stored".to_owned(),
-            GitHub::SignedIn(login) => format!("Signed in as {login}"),
-            GitHub::Refused => "GitHub refused the token: expired or revoked".to_owned(),
-            GitHub::Failed(why) => why.clone(),
+            Standing::Unknown | Standing::Working => "Checking…".to_owned(),
+            Standing::Missing => format!("No {} stored", service.secret()),
+            Standing::SignedIn(account) => format!("Signed in as {account}"),
+            Standing::Refused => format!(
+                "{} refused the {}: expired or revoked",
+                service.name(),
+                service.secret()
+            ),
+            Standing::Failed(why) => why.clone(),
         }
     }
 }
 
-/// The GitHub token's standing, and a count that goes up with every change.
-static GITHUB: Mutex<(u64, GitHub)> = Mutex::new((0, GitHub::Unknown));
+impl From<Failure> for Standing {
+    fn from(failure: Failure) -> Self {
+        match failure {
+            Failure::Missing => Standing::Missing,
+            Failure::Refused => Standing::Refused,
+            Failure::Other(why) => Standing::Failed(why),
+        }
+    }
+}
 
-/// Set the standing; the change count it gets.
-fn set(state: GitHub) -> u64 {
-    let mut github = GITHUB
+/// Each service's standing, and a count that goes up with every change.
+static STANDINGS: Mutex<[(u64, Standing); 2]> =
+    Mutex::new([(0, Standing::Unknown), (0, Standing::Unknown)]);
+
+fn standings() -> std::sync::MutexGuard<'static, [(u64, Standing); 2]> {
+    STANDINGS
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    github.0 += 1;
-    github.1 = state;
-    github.0
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Set `service`'s standing; the change count it gets.
+fn set(service: Service, standing: Standing) -> u64 {
+    let mut all = standings();
+    let entry = &mut all[service.index()];
+    entry.0 += 1;
+    entry.1 = standing;
+    entry.0
 }
 
 /// Set the standing a look begun at change `since` found, unless something
-/// changed it meanwhile: a token saved while an older one was being checked
+/// changed it meanwhile: a secret saved while an older one was being checked
 /// is not then reported refused.
-fn settle(since: u64, state: GitHub) {
-    let mut github = GITHUB
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if github.0 == since {
-        github.0 += 1;
-        github.1 = state;
+fn settle(service: Service, since: u64, standing: Standing) {
+    let mut all = standings();
+    let entry = &mut all[service.index()];
+    if entry.0 == since {
+        entry.0 += 1;
+        entry.1 = standing;
     }
 }
 
-/// The GitHub token's standing, with its change count.
-pub(crate) fn github() -> (u64, GitHub) {
-    GITHUB
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
+/// `service`'s standing, with its change count.
+pub(crate) fn standing(service: Service) -> (u64, Standing) {
+    standings()[service.index()].clone()
 }
 
-fn from_failure(failure: Failure) -> GitHub {
-    match failure {
-        Failure::Unauthorized => GitHub::Refused,
-        Failure::NoToken(why) if why == gh::api::NO_TOKEN => GitHub::Missing,
-        other => GitHub::Failed(other.to_string()),
-    }
-}
-
-/// Look at the stored token again, and ask GitHub whose it is.
+/// Look at every stored secret again, and ask each service whose it is.
 pub(crate) fn refresh() {
-    let since = set(GitHub::Working);
-    std::thread::spawn(move || {
-        settle(
-            since,
-            match gh::api::login() {
-                Ok(login) => GitHub::SignedIn(login),
-                Err(failure) => from_failure(failure),
-            },
-        );
-    });
+    for service in Service::ALL {
+        let since = set(service, Standing::Working);
+        std::thread::spawn(move || {
+            settle(
+                service,
+                since,
+                service
+                    .account()
+                    .map_or_else(Standing::from, Standing::SignedIn),
+            );
+        });
+    }
 }
 
 /// How often the tray tells the status line it is asking GitHub; well under
@@ -110,7 +230,8 @@ pub(crate) fn refresh() {
 const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Every [`HEARTBEAT`], note in the store whether this tray can ask GitHub
-/// (holds a token), so the status line asks by itself only when it cannot.
+/// (holds a token), so the status line asks by itself only when it cannot;
+/// and report a secret that has started to be refused.
 pub(crate) fn spawn_heartbeat() {
     std::thread::spawn(|| {
         loop {
@@ -120,26 +241,35 @@ pub(crate) fn spawn_heartbeat() {
     });
 }
 
-/// The refused token has been reported, so it is not again until a new one
-/// is accepted.
-static TOLD_REFUSED: AtomicBool = AtomicBool::new(false);
+/// Each service's refused secret has been reported, so it is not again until
+/// a new one is accepted.
+static TOLD_REFUSED: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
+
+/// Report `service`'s secret once when `refused` turns true.
+fn tell_if_refused(service: Service, refused: bool) {
+    let told = &TOLD_REFUSED[service.index()];
+    if refused && !told.swap(true, Ordering::SeqCst) {
+        set(service, Standing::Refused);
+        let (name, secret) = (service.name(), service.secret());
+        if std::env::var_os("SL_TRAY_NO_NOTIFY").is_none() {
+            crate::notify::send(
+                &format!("{name} {secret} expired or revoked"),
+                &format!(
+                    "{name} refused the tray's {secret}. Replace it in Settings → Integrations."
+                ),
+            );
+        }
+    } else if !refused {
+        told.store(false, Ordering::SeqCst);
+    }
+}
 
 /// Branches neither asked about nor shown for this long are forgotten.
 const FORGET_AFTER_MS: i64 = 30 * 24 * 60 * 60_000;
 
 fn beat() {
-    let refused = gh::api::token_refused();
-    if refused && !TOLD_REFUSED.swap(true, Ordering::SeqCst) {
-        set(GitHub::Refused);
-        if std::env::var_os("SL_TRAY_NO_NOTIFY").is_none() {
-            crate::notify::send(
-                "GitHub token expired or revoked",
-                "GitHub refused the tray's token. Replace it in Settings → Integrations.",
-            );
-        }
-    } else if !refused {
-        TOLD_REFUSED.store(false, Ordering::SeqCst);
-    }
+    tell_if_refused(Service::GitHub, gh::api::token_refused());
+    tell_if_refused(Service::Linear, crate::linear::key_refused());
     let Some(store) = gh::Store::open_default() else {
         return;
     };
@@ -153,63 +283,61 @@ fn beat() {
     store.prune(now_ms - FORGET_AFTER_MS);
 }
 
-/// After the token changed: forget the old one, lift the holds failures
-/// left, and ask about every session's PR again.
-fn token_changed() {
-    gh::api::token_replaced();
-    if let Some(store) = gh::Store::open_default() {
-        store.release_failed();
-    }
-    beat();
-    crate::sessions::looked();
-}
-
-/// Check `token` with GitHub, and store it if GitHub knows whose it is.
-pub(crate) fn save(token: &str) {
-    if crate::effects::intercept(crate::effects::Effect::SaveToken) {
+/// Check `secret` with `service`, and store it if the service knows whose
+/// it is.
+pub(crate) fn save(service: Service, secret: &str) {
+    if crate::effects::intercept(crate::effects::Effect::SaveSecret(service)) {
         return;
     }
-    let token = token.trim().to_owned();
-    if !crate::keychain::is_well_formed(&token) {
-        set(GitHub::Failed(
-            "That does not look like a GitHub token.".to_owned(),
-        ));
+    let secret = secret.trim().to_owned();
+    if !crate::keychain::is_well_formed(&secret) {
+        set(
+            service,
+            Standing::Failed(format!(
+                "That does not look like a {} {}.",
+                service.name(),
+                service.secret()
+            )),
+        );
         return;
     }
-    let since = set(GitHub::Working);
+    let since = set(service, Standing::Working);
     std::thread::spawn(move || {
-        let state = match gh::api::login_of(&token) {
-            Ok(login) => match crate::keychain::save(&token) {
+        let standing = match service.account_of(&secret) {
+            Ok(account) => match service.item().save(&secret) {
                 Ok(()) => {
-                    token_changed();
-                    GitHub::SignedIn(login)
+                    service.changed();
+                    Standing::SignedIn(account)
                 }
-                Err(why) => GitHub::Failed(why),
+                Err(why) => Standing::Failed(why),
             },
-            Err(Failure::Unauthorized) => {
-                GitHub::Failed("GitHub refused that token; nothing was stored.".to_owned())
-            }
-            Err(failure) => GitHub::Failed(failure.to_string()),
+            Err(Failure::Refused) => Standing::Failed(format!(
+                "{} refused that {}; nothing was stored.",
+                service.name(),
+                service.secret()
+            )),
+            Err(failure) => Standing::from(failure),
         };
-        settle(since, state);
+        settle(service, since, standing);
     });
 }
 
-/// Delete the stored token.
-pub(crate) fn remove() {
-    if crate::effects::intercept(crate::effects::Effect::RemoveToken) {
+/// Delete `service`'s stored secret.
+pub(crate) fn remove(service: Service) {
+    if crate::effects::intercept(crate::effects::Effect::RemoveSecret(service)) {
         return;
     }
-    let since = set(GitHub::Working);
+    let since = set(service, Standing::Working);
     std::thread::spawn(move || {
         settle(
+            service,
             since,
-            match crate::keychain::remove() {
+            match service.item().remove() {
                 Ok(()) => {
-                    token_changed();
-                    GitHub::Missing
+                    service.changed();
+                    Standing::Missing
                 }
-                Err(why) => GitHub::Failed(why),
+                Err(why) => Standing::Failed(why),
             },
         );
     });

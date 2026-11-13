@@ -359,7 +359,7 @@ fn main() {
 
     // GitHub is asked with the token in the tray's own Keychain item; the
     // self-test and the previews above never get this far.
-    sl_core::gh::api::use_token_source(keychain::read);
+    sl_core::gh::api::use_token_source(keychain::github_token);
 
     let auto_awake = awake::AutoCaffeinate::new(AtomicBool::new(awake::load()));
     // `SL_TRAY_FIXTURE`: made-up state and no background threads, for
@@ -383,6 +383,7 @@ fn main() {
         None => {
             // Seed with an empty snapshot so the first paint has something to
             // draw before the background thread's first refresh lands.
+            sessions::watch_network();
             let shared = latest::new(Snapshots::empty(now_ms()));
             refresh::spawn(Arc::clone(&shared), flags.rebuild);
             let board = crate::latest::new(sessions::Published::default());

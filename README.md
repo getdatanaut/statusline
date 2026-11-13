@@ -270,10 +270,23 @@ asks again about anything older than 30 seconds.
 
 A branch named for a Linear ticket (`jakub/dn-479-…` is `DN-479`) shows the
 ticket and its state (`DN-479 · In Progress`) in the session's submenu and on its
-Compact card, with an Open in Linear action. It is looked up with the `linear`
-command line tool, which must be installed and signed in (`linear auth login`);
-without it nothing is shown. Lookups follow the PR & CI refresh interval, and
-Settings can switch them off.
+Compact card, with an Open in Linear action. It is looked up with Linear's API,
+using a personal API key you paste in Settings → Integrations (Create key…
+opens Linear's Security & access settings, where keys are made; read access is
+enough). The key is kept like the GitHub token: in its own login Keychain item
+only the tray can read, so the same signing certificate covers it. Without a
+key nothing is shown. All the open sessions' tickets are asked about in one
+request, which gives up after 10 seconds; when it fails, what was known stays
+shown. Lookups follow the PR & CI refresh interval, and Settings can switch
+them off. A key Linear starts refusing is reported once, in a notification and
+in Settings.
+
+**One Linear workspace only.** A Linear API key belongs to a single workspace,
+and the tray holds one key, so tickets from any other workspace are not found
+(and the `linear` CLI's per-project `.linear.toml` is not read). Saving a key
+from another workspace replaces the first. Several workspaces would need a key
+for each, with tickets sent to the workspace that owns their team key; that is
+not built.
 
 In Regular, hover a session for its submenu: the PR (draft or ready, base branch), each
 reviewer and their verdict, copy the unresolved review feedback (its reviews,

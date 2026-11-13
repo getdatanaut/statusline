@@ -323,6 +323,18 @@ impl StackCache {
         states.unwrap_or_default()
     }
 
+    /// Ask about everything again at the next round, keeping what is known
+    /// meanwhile: the network came back, and what failed while it was gone
+    /// (or just before) says nothing about now.
+    pub fn due_now(&mut self) {
+        for (at, _) in self.repos.values_mut() {
+            *at = i64::MIN;
+        }
+        for (at, _, _) in self.states.values_mut() {
+            *at = i64::MIN;
+        }
+    }
+
     /// Forget repositories and directories no session is in any more.
     fn retain(&mut self, repos: &HashSet<PathBuf>, dirs: &HashSet<&str>) {
         self.repos.retain(|repo, _| repos.contains(repo));

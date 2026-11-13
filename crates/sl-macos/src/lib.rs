@@ -17,6 +17,7 @@ pub mod controls;
 pub mod delegate;
 pub mod draw;
 pub mod event;
+pub mod network;
 pub mod notify;
 pub mod process;
 pub mod system;
