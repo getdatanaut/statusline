@@ -8,6 +8,7 @@ pub mod branch;
 pub mod format;
 pub mod gh;
 pub mod git;
+pub mod http;
 pub mod num;
 pub mod paths;
 pub mod process;

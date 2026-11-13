@@ -1,5 +1,4 @@
-//! GitHub's API, sent with `/usr/bin/curl` (at a fixed path, so a bare `PATH`
-//! does not matter, and without a TLS stack compiled into the status line).
+//! GitHub's API, sent with `/usr/bin/curl` through [`crate::http`].
 //!
 //! PRs are asked about with GraphQL: one request per repository, however
 //! many branches. A few things only the REST API has (stacks, Actions jobs)
@@ -11,7 +10,6 @@
 //! (the Keychain locked, or the prompt denied), for [`RETRY_UNREADABLE`].
 
 use std::fmt::Write as _;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
@@ -47,7 +45,6 @@ impl std::fmt::Display for Failure {
 pub type Post<'a> = dyn Fn(&str) -> Result<String, Failure> + Sync + 'a;
 
 const API: &str = "https://api.github.com";
-const CURL: &str = "/usr/bin/curl";
 /// curl's own limit for a PR lookup.
 const POST_SECS: u64 = 15;
 /// Branches asked about in one request; more are split over several.
@@ -94,7 +91,6 @@ enum Read {
     /// It could not be read: not tried again until the instant passes.
     Unreadable(String, Instant),
 }
-static OFFLINE: AtomicBool = AtomicBool::new(false);
 /// The Keychain had no token the last time it was read.
 static MISSING: AtomicBool = AtomicBool::new(false);
 /// GitHub refused the stored token at the last request: expired or revoked.
@@ -109,7 +105,7 @@ pub fn use_token_source(source: TokenSource) {
 /// tray's self-test, whose stubbed `PATH` can catch neither `/usr/bin/curl`
 /// nor the Keychain.
 pub fn go_offline() {
-    OFFLINE.store(true, Ordering::SeqCst);
+    crate::http::go_offline();
     forget_token();
 }
 
@@ -135,7 +131,7 @@ pub fn token_replaced() {
 
 /// Whether [`go_offline`] was called.
 pub fn is_offline() -> bool {
-    OFFLINE.load(Ordering::SeqCst)
+    crate::http::is_offline()
 }
 
 fn cached_token() -> MutexGuard<'static, Read> {
@@ -204,20 +200,9 @@ pub fn can_ask() -> bool {
     !token_refused() && has_token()
 }
 
-/// What came back from one request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Response {
-    pub status: u16,
-    pub body: String,
-    /// Where a redirect points, which is not followed.
-    pub location: Option<String>,
-}
+pub use crate::http::Response;
 
 impl Response {
-    fn is_success(&self) -> bool {
-        (200..300).contains(&self.status)
-    }
-
     /// The body of a 2xx answer, else a [`Failure::Request`] quoting it.
     ///
     /// # Errors
@@ -227,16 +212,12 @@ impl Response {
         if self.is_success() {
             Ok(self.body)
         } else {
-            let message = serde_json::from_str::<Value>(&self.body)
-                .ok()
-                .and_then(|v| v.get("message").and_then(Value::as_str).map(str::to_owned))
-                .unwrap_or_else(|| self.body.chars().take(200).collect());
-            Err(Failure::Request(format!("HTTP {}: {message}", self.status)))
+            Err(Failure::Request(self.error_text()))
         }
     }
 }
 
-/// One request with curl: `method` to `url`, with `body` as JSON, the token
+/// One request to GitHub: `method` to `url`, with `body` as JSON, the token
 /// (from stdin) when `token` is given, never following a redirect.
 fn send(
     method: &str,
@@ -245,62 +226,19 @@ fn send(
     token: Option<&str>,
     secs: u64,
 ) -> Result<Response, Failure> {
-    if is_offline() {
-        return Err(Failure::Request("offline".to_owned()));
-    }
-    let mut command = Command::new(CURL);
-    command.args([
-        "--silent",
-        "--show-error",
-        "--max-time",
-        &secs.to_string(),
-        "--request",
+    let header = token.map(|token| format!("Authorization: bearer {token}"));
+    crate::http::send(
         method,
-        // The authorization header, if any, read from stdin.
-        "--header",
-        "@-",
-        "--header",
-        "Accept: application/vnd.github+json",
-        "--header",
-        "User-Agent: statusline",
-        "--write-out",
-        "\n%{http_code}\n%{redirect_url}",
-    ]);
-    if let Some(body) = body {
-        command.args([
-            "--header",
-            "Content-Type: application/json",
-            "--data-raw",
-            body,
-        ]);
-    }
-    command.arg(url);
-    let header = token.map_or_else(String::new, |token| {
-        format!("Authorization: bearer {token}\n")
-    });
-    let ran =
-        crate::process::run_with_input(command, header.as_bytes(), Duration::from_secs(secs + 5))
-            .map_err(|error| Failure::Request(format!("curl: {error:?}")))?;
-    if !ran.success {
-        return Err(Failure::Request(ran.stderr.trim().to_owned()));
-    }
-    // The body, then the two lines `--write-out` added.
-    let mut parts = ran.stdout.rsplitn(3, '\n');
-    let (Some(location), Some(code), Some(body)) = (parts.next(), parts.next(), parts.next())
-    else {
-        return Err(Failure::Request("no status from curl".to_owned()));
-    };
-    let status = code
-        .trim()
-        .parse()
-        .map_err(|_not_a_number| Failure::Request(format!("no status from curl: {code:?}")))?;
-    Ok(Response {
-        status,
-        body: body.to_owned(),
-        location: Some(location.trim())
-            .filter(|l| !l.is_empty())
-            .map(str::to_owned),
-    })
+        url,
+        body,
+        header.as_deref(),
+        &[
+            "Accept: application/vnd.github+json",
+            "User-Agent: statusline",
+        ],
+        secs,
+    )
+    .map_err(Failure::Request)
 }
 
 /// [`send`] with the stored token; a refused token is forgotten, so the

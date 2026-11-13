@@ -170,10 +170,13 @@ const EXPECTED: &[&str] = &[
     "settings / [80 / 90 %] => set ringNotePct=80",
     "settings / A CI job fails on a session's PR => set notifyCiFailures=0",
     "settings / A PR in a stack needs a rebase => set notifyStackRebase=1",
-    // Integrations: recorded, so the real Keychain item is never touched.
+    // Integrations: recorded, so the real Keychain items are never touched.
     "settings / Create token… => open https://github.com/settings/tokens/new?scopes=repo,read:org&description=Statusline%20Tray",
     "settings / Remove => remove GitHub token",
     "settings / Save => save GitHub token",
+    "settings / Create key… => open https://linear.app/settings/account/security",
+    "settings / Remove #2 => remove Linear key",
+    "settings / Save #2 => save Linear key",
     // Closed Sessions: each row's buttons are about that row's session.
     "closed / Copy Resume => copy \"claude --resume c1\"",
     "closed / Zed #2 => zed /x/c2",

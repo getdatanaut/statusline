@@ -193,7 +193,7 @@ pub struct OpenSession {
     /// until the status line has rendered for it.
     pub context: Option<ContextCapture>,
     /// The Linear ticket the branch is named for, when there is one and
-    /// the `linear` tool could say.
+    /// Linear could say.
     pub linear: Option<crate::linear::LinearInfo>,
     /// Claude Code's, or a Codex thread (see [`crate::codex_sessions`]).
     pub provider: Source,
@@ -633,21 +633,20 @@ pub enum Arrival {
     /// Each directory's PR and CI, by directory; `None` where it has none.
     Gh(HashMap<String, Option<GhInfo>>),
     /// The tickets asked about, each `None` where the lookup failed.
-    Linear(Vec<(String, Option<crate::linear::LinearInfo>)>),
+    Linear(Vec<(String, crate::linear::Lookup)>),
 }
 
-/// Pairs to ask the network about: a directory and its branch, or a ticket
-/// and a directory to ask from.
+/// Directories to ask GitHub about, each with its branch.
 type Asks = Vec<(String, String)>;
 
 /// What to ask the network about `sessions`: each directory with its branch,
-/// and each ticket that is due, with a directory to ask from.
+/// and each ticket that is due.
 pub fn network_asks(
     sessions: &[OpenSession],
     linear: Option<&crate::linear::LinearCache>,
     now_ms: i64,
     pr_secs: u64,
-) -> (Asks, Asks) {
+) -> (Asks, Vec<String>) {
     let mut dirs: Vec<(String, String)> = sessions
         .iter()
         .filter_map(|s| Some((s.cwd.clone(), s.branch.clone()?)))
@@ -657,48 +656,51 @@ pub fn network_asks(
     let max_age = i64::try_from(pr_secs)
         .unwrap_or(i64::MAX)
         .saturating_mul(1000);
-    let mut tickets: Vec<(String, String)> = linear
+    let mut tickets: Vec<String> = linear
         .map(|cache| {
             sessions
                 .iter()
-                .filter_map(|s| {
-                    Some((
-                        sl_core::branch::ticket_id(s.branch.as_deref()?)?,
-                        s.cwd.clone(),
-                    ))
-                })
-                .filter(|(id, _)| cache.due(id, now_ms, max_age))
+                .filter_map(|s| sl_core::branch::ticket_id(s.branch.as_deref()?))
+                .filter(|id| cache.due(id, now_ms, max_age))
                 .collect()
         })
         .unwrap_or_default();
     tickets.sort();
-    tickets.dedup_by(|a, b| a.0 == b.0);
+    tickets.dedup();
     (dirs, tickets)
 }
 
-/// Ask Linear about every ticket, all at once, and hand the answers to
-/// `arrived`. GitHub is asked apart, by [`GithubRound`], so it never holds a
-/// pass up.
+/// Ask Linear about every ticket in one request, and hand the answers to
+/// `arrived`: [`Missing`](crate::linear::Lookup::Missing) for a ticket Linear
+/// has not got, [`Failed`](crate::linear::Lookup::Failed) for every ticket
+/// when the request failed (the cache then keeps what it knew). GitHub is
+/// asked apart, by [`GithubRound`], so it never holds a pass up.
 pub fn ask_linear(
-    tickets: &[(String, String)],
-    ask: impl Fn(&str, &str) -> Option<crate::linear::LinearInfo> + Sync,
+    tickets: &[String],
+    ask: impl FnOnce(
+        &[String],
+    ) -> Result<HashMap<String, crate::linear::LinearInfo>, crate::linear::Failure>,
     arrived: impl FnOnce(Arrival),
 ) {
     if tickets.is_empty() {
         return;
     }
-    let keys: std::collections::BTreeSet<&str> =
-        tickets.iter().map(|(id, _)| id.as_str()).collect();
-    let cwd_of: HashMap<&str, &str> = tickets
-        .iter()
-        .map(|(id, cwd)| (id.as_str(), cwd.as_str()))
-        .collect();
-    let found = each_dir(
-        &keys,
-        |id| cwd_of.get(id).and_then(|cwd| ask(id, cwd)),
-        |_| None,
-    );
-    arrived(Arrival::Linear(found.into_iter().collect()));
+    let answer = ask(tickets);
+    arrived(Arrival::Linear(
+        tickets
+            .iter()
+            .map(|id| {
+                let lookup = match &answer {
+                    Ok(found) => found
+                        .get(id)
+                        .cloned()
+                        .map_or(crate::linear::Lookup::Missing, crate::linear::Lookup::Found),
+                    Err(_) => crate::linear::Lookup::Failed,
+                };
+                (id.clone(), lookup)
+            })
+            .collect(),
+    ));
 }
 
 /// The longest one round of GitHub requests may take, all of them together.
@@ -844,8 +846,8 @@ pub fn apply_arrival(
         }
         Arrival::Linear(found) => {
             let Some(cache) = linear else { return };
-            for (id, info) in found {
-                cache.store(id, now_ms, info);
+            for (id, lookup) in found {
+                cache.store(id, now_ms, lookup);
             }
             for session in sessions.iter_mut() {
                 session.linear = session
@@ -861,31 +863,6 @@ pub fn apply_arrival(
             );
         }
     }
-}
-
-/// `resolve` for each of `dirs`, all at once; `failed` for one whose
-/// thread panicked.
-fn each_dir<T: Send>(
-    dirs: &std::collections::BTreeSet<&str>,
-    resolve: impl Fn(&str) -> T + Sync,
-    failed: impl Fn(&str) -> T,
-) -> HashMap<String, T> {
-    std::thread::scope(|scope| {
-        let resolve = &resolve;
-        let running: Vec<_> = dirs
-            .iter()
-            .map(|&cwd| (cwd, scope.spawn(move || resolve(cwd))))
-            .collect();
-        running
-            .into_iter()
-            .map(|(cwd, thread)| {
-                (
-                    cwd.to_owned(),
-                    thread.join().unwrap_or_else(|_| failed(cwd)),
-                )
-            })
-            .collect()
-    })
 }
 
 /// The context capture the status line wrote for `session_id`, if any.
@@ -948,6 +925,11 @@ pub fn spawn(
                 let poll = crate::view_prefs::load_poll();
                 let show_linear =
                     crate::view_prefs::load_switch(crate::view_prefs::Switch::ShowLinear);
+                // A new key (or none): what the old one found, or failed to,
+                // says nothing of what this one will.
+                if crate::linear::take_key_change() {
+                    linear = crate::linear::LinearCache::default();
+                }
                 let previous = crate::latest::get(&board);
                 let pr_age = i64::try_from(poll.pr_secs)
                     .unwrap_or(i64::MAX)
@@ -1855,33 +1837,6 @@ fn plain(segs: &[Seg]) -> String {
 mod tests {
     use super::*;
     use sl_core::gh::{Ci, FailedJob};
-
-    #[test]
-    fn every_directory_is_resolved_at_once() {
-        let dirs: std::collections::BTreeSet<&str> = ["/a", "/b", "/c"].into_iter().collect();
-        // Each waits (up to 5 s) for all three to be running at once.
-        let running = std::sync::atomic::AtomicUsize::new(0);
-        let found = each_dir(
-            &dirs,
-            |cwd| {
-                running.fetch_add(1, Ordering::SeqCst);
-                let start = Instant::now();
-                while running.load(Ordering::SeqCst) < 3
-                    && start.elapsed() < std::time::Duration::from_secs(5)
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-                format!("{cwd} beside {}", running.load(Ordering::SeqCst))
-            },
-            |cwd| format!("{cwd} failed"),
-        );
-        assert_eq!(
-            found.get("/b").map(String::as_str),
-            Some("/b beside 3"),
-            "all three ran together: {found:?}"
-        );
-        assert_eq!(found.len(), 3);
-    }
 
     /// A reader keeps the whole poll it took, open and closed alike, while
     /// an edit swaps in a changed copy for the next reader.
@@ -2902,25 +2857,43 @@ mod tests {
     }
 
     #[test]
-    fn linear_is_asked_about_each_ticket_once_and_not_at_all_with_none_due() {
+    fn linear_is_asked_about_every_ticket_in_one_go_and_not_at_all_with_none_due() {
+        use crate::linear::Lookup;
         let mut got = Vec::new();
+        let mut asked = Vec::new();
         ask_linear(
-            &[
-                ("DN-1".to_owned(), "/a".to_owned()),
-                ("DN-2".to_owned(), "/b".to_owned()),
-            ],
-            |id, _| Some(ticket(id)),
+            &["DN-1".to_owned(), "DN-2".to_owned()],
+            |ids| {
+                asked.push(ids.to_vec());
+                Ok(HashMap::from([("DN-1".to_owned(), ticket("DN-1"))]))
+            },
             |arrival| got.push(arrival),
         );
+        assert_eq!(asked, [["DN-1", "DN-2"]], "one request for both");
         let [Arrival::Linear(found)] = got.as_slice() else {
             panic!("one Linear arrival: {got:?}");
         };
-        let mut ids: Vec<&str> = found.iter().map(|(id, _)| id.as_str()).collect();
-        ids.sort_unstable();
-        assert_eq!(ids, ["DN-1", "DN-2"]);
+        assert_eq!(
+            found,
+            &[
+                ("DN-1".to_owned(), Lookup::Found(ticket("DN-1"))),
+                ("DN-2".to_owned(), Lookup::Missing)
+            ],
+            "a ticket Linear has not got arrives as missing"
+        );
+        got.clear();
+        ask_linear(
+            &["DN-1".to_owned()],
+            |_| Err(crate::linear::Failure::Refused),
+            |arrival| got.push(arrival),
+        );
+        assert!(
+            matches!(got.as_slice(), [Arrival::Linear(found)] if found == &[("DN-1".to_owned(), Lookup::Failed)]),
+            "a failed request is told apart from a missing ticket: {got:?}"
+        );
         ask_linear(
             &[],
-            |_, _| panic!("Linear asked with nothing due"),
+            |_| panic!("Linear asked with nothing due"),
             |_| panic!("an arrival with nothing asked"),
         );
     }
@@ -2982,7 +2955,10 @@ mod tests {
         assert!(sessions[1].gh.is_none());
         apply_arrival(
             &mut sessions,
-            Arrival::Linear(vec![("DN-1".into(), Some(ticket("DN-1")))]),
+            Arrival::Linear(vec![(
+                "DN-1".into(),
+                crate::linear::Lookup::Found(ticket("DN-1")),
+            )]),
             Some(&mut cache),
             0,
         );
@@ -2993,7 +2969,7 @@ mod tests {
         // Linear down: the ticket stays as it was.
         apply_arrival(
             &mut sessions,
-            Arrival::Linear(vec![("DN-1".into(), None)]),
+            Arrival::Linear(vec![("DN-1".into(), crate::linear::Lookup::Failed)]),
             Some(&mut cache),
             60_000,
         );
@@ -3024,22 +3000,14 @@ mod tests {
             dirs.iter().map(|(cwd, _)| cwd.as_str()).collect::<Vec<_>>(),
             ["/a", "/b", "/c"]
         );
-        assert_eq!(
-            tickets
-                .iter()
-                .map(|(id, _)| id.as_str())
-                .collect::<Vec<_>>(),
-            ["DN-1", "DN-2"]
+        assert_eq!(tickets, ["DN-1", "DN-2"]);
+        cache.store(
+            "DN-1".into(),
+            0,
+            crate::linear::Lookup::Found(ticket("DN-1")),
         );
-        cache.store("DN-1".into(), 0, Some(ticket("DN-1")));
-        cache.store("DN-2".into(), 0, None);
-        let due = |now| {
-            network_asks(&sessions, Some(&cache), now, 60)
-                .1
-                .into_iter()
-                .map(|(id, _)| id)
-                .collect::<Vec<_>>()
-        };
+        cache.store("DN-2".into(), 0, crate::linear::Lookup::Missing);
+        let due = |now| network_asks(&sessions, Some(&cache), now, 60).1;
         assert!(due(59_000).is_empty(), "both answered a moment ago");
         assert_eq!(
             due(60_000),
@@ -3047,6 +3015,17 @@ mod tests {
             "a found ticket after the PR interval; a miss five times later"
         );
         assert_eq!(due(300_000), ["DN-1", "DN-2"]);
+        // Linear down when DN-3 was first asked about: asked again after the
+        // PR interval, as a found ticket is, not five times later.
+        let mut down = crate::linear::LinearCache::default();
+        down.store("DN-1".into(), 0, crate::linear::Lookup::Failed);
+        down.store("DN-2".into(), 0, crate::linear::Lookup::Missing);
+        down.store("DN-2".into(), 1_000, crate::linear::Lookup::Failed);
+        assert_eq!(
+            network_asks(&sessions, Some(&down), 60_000, 60).1,
+            ["DN-1"],
+            "a failed first ask is due at once after the interval; a known miss stays slow"
+        );
         assert!(
             network_asks(&sessions, None, 0, 60).1.is_empty(),
             "Linear switched off: never asked"

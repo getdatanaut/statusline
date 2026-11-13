@@ -14,25 +14,27 @@
 //!   one switch per kind
 //! Integrations
 //!   GitHub      the account, the token field, Create token…, Remove, Save
+//!   Linear      the account, the key field, Create key…, Remove, Save
 //! ```
 //!
 //! A window rather than a menu: a menu bar app cannot reliably open a second
 //! menu from a click in its first, and a window can hold more than choices.
 //! Every control acts at once; there is nothing to apply or save, but for
-//! the GitHub token, which is saved with its own button.
+//! the GitHub token and the Linear key, each saved with its own button.
 
 use std::rc::Rc;
 
 use crate::act::Act;
+use crate::integrations::Service;
 use objc2::MainThreadOnly;
 use objc2::rc::Retained;
 use objc2_app_kit::{
     NSAccessibility, NSApplication, NSBox, NSBoxType, NSButton, NSColor, NSControlSize,
     NSControlStateValueOff, NSControlStateValueOn, NSFont, NSImage, NSImageView,
-    NSMutableParagraphStyle, NSPopUpButton, NSSlider, NSSplitViewController, NSSplitViewItem,
-    NSSecureTextField, NSSwitch, NSTabView, NSTabViewType, NSTextAlignment, NSTextField, NSTitlePosition, NSToolbar,
-    NSView, NSViewController, NSWindow, NSWindowStyleMask, NSWindowTitleVisibility,
-    NSWindowToolbarStyle,
+    NSMutableParagraphStyle, NSPopUpButton, NSSecureTextField, NSSlider, NSSplitViewController,
+    NSSplitViewItem, NSSwitch, NSTabView, NSTabViewType, NSTextAlignment, NSTextField,
+    NSTitlePosition, NSToolbar, NSView, NSViewController, NSWindow, NSWindowStyleMask,
+    NSWindowTitleVisibility, NSWindowToolbarStyle,
 };
 use objc2_foundation::{MainThreadMarker, NSAttributedString, NSPoint, NSRect, NSSize, NSString};
 
@@ -61,9 +63,9 @@ const ROW_INSET: f64 = 14.0;
 const ROW_PAD: f64 = 9.0;
 const MIN_ROW: f64 = 38.0;
 const POPUP_WIDTH: f64 = 130.0;
-/// The GitHub token field, and the account line over it.
+/// A token or key field on the Integrations page.
 const TOKEN_WIDTH: f64 = 200.0;
-/// The GitHub account line.
+/// An account line over it.
 const ACCOUNT_WIDTH: f64 = 280.0;
 
 /// Everything the controls show: the settings in use.
@@ -103,8 +105,80 @@ pub(crate) struct SettingsWindow {
     cache_lead: Retained<NSPopUpButton>,
     ring: Retained<NSPopUpButton>,
     notify: Vec<Retained<NSSwitch>>,
-    /// Keeps the GitHub account line in step with [`crate::integrations`].
-    _github_timer: sl_macos::timer::RepeatingTimer,
+    /// Keep the GitHub and Linear account lines in step with
+    /// [`crate::integrations`].
+    _timers: [sl_macos::timer::RepeatingTimer; 2],
+}
+
+/// `service`'s section of the Integrations page: whose secret is stored, a
+/// field to paste a new one into, and Create…, Remove and Save. The timer it
+/// returns keeps the account line up to date while the window lives.
+fn integration_section(
+    page: &mut Page,
+    mtm: MainThreadMarker,
+    service: Service,
+    placeholder: &str,
+    note: &str,
+) -> sl_macos::timer::RepeatingTimer {
+    let secret = service.secret();
+    page.heading(service.name());
+    page.begin_card();
+    let account = NSTextField::labelWithString(&NSString::from_str(""), mtm);
+    account.setAlignment(NSTextAlignment::Right);
+    account.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    // Wider than the field: `GitHub refused the token: expired or revoked`.
+    account.setFrameSize(NSSize::new(ACCOUNT_WIDTH, 18.0));
+    page.row("Account", None, &account);
+    let field = NSSecureTextField::new(mtm);
+    field.setPlaceholderString(Some(&NSString::from_str(placeholder)));
+    field.setFrameSize(NSSize::new(TOKEN_WIDTH, 22.0));
+    let title: String = secret
+        .chars()
+        .take(1)
+        .flat_map(char::to_uppercase)
+        .chain(secret.chars().skip(1))
+        .collect();
+    page.row(&title, Some(note), &field);
+    let create = sl_macos::controls::button(mtm, &format!("Create {secret}…"));
+    let remove = sl_macos::controls::button(mtm, "Remove");
+    let save = sl_macos::controls::button(mtm, "Save");
+    let mut x = 0.0;
+    let mut buttons_height: f64 = 0.0;
+    for button in [&create, &remove, &save] {
+        button.sizeToFit();
+        button.setFrameOrigin(NSPoint::new(x, 0.0));
+        x += button.frame().size.width + 8.0;
+        buttons_height = buttons_height.max(button.frame().size.height);
+    }
+    let holder = NSView::initWithFrame(
+        mtm.alloc(),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(x - 8.0, buttons_height)),
+    );
+    holder.addSubview(&create);
+    holder.addSubview(&remove);
+    holder.addSubview(&save);
+    page.row("", None, &holder);
+    page.end_card();
+    {
+        let field = field.clone();
+        sl_macos::action::bind(&save, move |_| {
+            let typed = field.stringValue().to_string();
+            field.setStringValue(&NSString::from_str(""));
+            crate::integrations::save(service, &typed);
+        });
+    }
+    sl_macos::action::bind(&remove, move |_| crate::integrations::remove(service));
+    sl_macos::action::bind(&create, move |_| {
+        crate::actions::open_url(service.new_secret_url());
+    });
+    let mut shown = None;
+    sl_macos::timer::RepeatingTimer::common_modes(0.5, 0.25, move || {
+        let (count, standing) = crate::integrations::standing(service);
+        if shown != Some(count) {
+            shown = Some(count);
+            account.setStringValue(&NSString::from_str(&standing.text(service)));
+        }
+    })
 }
 
 /// Lays grouped cards down one column of a tab, as System Settings does: a
@@ -502,69 +576,29 @@ impl SettingsWindow {
 
         // ---- Integrations
         let mut links = Page::new(mtm);
-        links.heading("GitHub");
-        links.begin_card();
-        let account = NSTextField::labelWithString(&NSString::from_str(""), mtm);
-        account.setAlignment(NSTextAlignment::Right);
-        account.setTextColor(Some(&NSColor::secondaryLabelColor()));
-        // Wider than the field: `GitHub refused the token: expired or revoked`.
-        account.setFrameSize(NSSize::new(ACCOUNT_WIDTH, 18.0));
-        links.row("Account", None, &account);
-        let field = NSSecureTextField::new(mtm);
-        field.setPlaceholderString(Some(&NSString::from_str("ghp_… or github_pat_…")));
-        field.setFrameSize(NSSize::new(TOKEN_WIDTH, 22.0));
-        links.row(
-            "Token",
-            Some("A classic token with the repo and read:org scopes. Kept in your login Keychain."),
-            &field,
+        let github_timer = integration_section(
+            &mut links,
+            mtm,
+            Service::GitHub,
+            "ghp_… or github_pat_…",
+            "A classic token with the repo and read:org scopes. Kept in your login Keychain.",
         );
-        let create = sl_macos::controls::button(mtm, "Create token…");
-        let remove = sl_macos::controls::button(mtm, "Remove");
-        let save = sl_macos::controls::button(mtm, "Save");
-        let mut x = 0.0;
-        let mut buttons_height: f64 = 0.0;
-        for button in [&create, &remove, &save] {
-            button.sizeToFit();
-            button.setFrameOrigin(NSPoint::new(x, 0.0));
-            x += button.frame().size.width + 8.0;
-            buttons_height = buttons_height.max(button.frame().size.height);
-        }
-        let holder = NSView::initWithFrame(
-            mtm.alloc(),
-            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(x - 8.0, buttons_height)),
+        let linear_timer = integration_section(
+            &mut links,
+            mtm,
+            Service::Linear,
+            "lin_api_…",
+            "A personal API key for one workspace; read access is enough. Kept in your login Keychain.",
         );
-        holder.addSubview(&create);
-        holder.addSubview(&remove);
-        holder.addSubview(&save);
-        links.row("", None, &holder);
-        links.end_card();
-        {
-            let field = field.clone();
-            sl_macos::action::bind(&save, move |_| {
-                let token = field.stringValue().to_string();
-                field.setStringValue(&NSString::from_str(""));
-                crate::integrations::save(&token);
-            });
-        }
-        sl_macos::action::bind(&remove, |_| crate::integrations::remove());
-        sl_macos::action::bind(&create, |_| {
-            crate::actions::open_url(crate::integrations::NEW_TOKEN_URL);
-        });
-        let github_timer = {
-            let account = account.clone();
-            let mut shown = None;
-            sl_macos::timer::RepeatingTimer::common_modes(0.5, 0.25, move || {
-                let (count, state) = crate::integrations::github();
-                if shown != Some(count) {
-                    shown = Some(count);
-                    account.setStringValue(&NSString::from_str(&state.text()));
-                }
-            })
-        };
 
-        let height = [general.finish(), list.finish(), alerts.finish(), links.finish()]
-            .into_iter()
-            .fold(0.0, f64::max);
+        let height = [
+            general.finish(),
+            list.finish(),
+            alerts.finish(),
+            links.finish(),
+        ]
+        .into_iter()
+        .fold(0.0, f64::max);
         let tabs = NSTabView::initWithFrame(
             NSTabView::alloc(mtm),
             NSRect::new(NSPoint::new(0.0, TOP_BAR), NSSize::new(WIDTH, height)),
@@ -740,7 +774,7 @@ impl SettingsWindow {
             cache_lead,
             ring,
             notify,
-            _github_timer: github_timer,
+            _timers: [github_timer, linear_timer],
         }
     }
 
