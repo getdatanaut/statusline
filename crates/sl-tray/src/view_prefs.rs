@@ -428,8 +428,10 @@ pub fn save_notify(index: usize, on: bool) {
 /// each refresh that finds new rows writes them and folds the snapshot again.
 pub const USAGE_EVERY: [u64; 3] = [15, 30, 45];
 const USAGE_DEFAULT: u64 = 15;
-/// How long a PR's CI and reviews are reused before `gh` is asked again, in
-/// seconds. A branch with no PR is asked about a fifth as often.
+/// How often GitHub is asked about an active branch, in seconds: one pushed
+/// in the last quarter hour, or whose checks are still running soon after a
+/// push. Other open PRs are asked about every ten minutes, and when the menu
+/// opens (see `gh::sync::Policy`).
 pub const PR_EVERY: [u64; 3] = [30, 60, 300];
 const PR_DEFAULT: u64 = 60;
 

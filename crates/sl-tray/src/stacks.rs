@@ -1,7 +1,7 @@
 //! Stacks of pull requests the sessions' branches belong to.
 //!
 //! Two kinds. GitHub's own stacks (what `gh stack submit` makes) are read from
-//! the `repos/{owner}/{repo}/stacks` endpoint, one call per repository: each
+//! the REST API's `repos/{owner}/{repo}/stacks`, one call per repository: each
 //! lists its PRs bottom to top with their state. A hand-made stack -- each PR
 //! based on the branch of the one below -- is pieced together from the parent
 //! PR each session's PR records (`GhInfo::base_pr`).
@@ -20,15 +20,17 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use serde::Deserialize;
+
+use sl_core::gh::api::Budget;
 
 use crate::sessions::OpenSession;
 use crate::sticky::Remembered;
 
-/// A lookup is abandoned after this long; it runs on the sessions thread.
-const TIMEOUT: Duration = Duration::from_secs(15);
+/// A lookup is abandoned after this many seconds, or sooner when the round's
+/// [`Budget`] runs out first.
+const TIMEOUT_SECS: u64 = 15;
 /// A repository whose stacks could not be read is asked again this many
 /// times less often than one whose could.
 const FAILED_SLOWDOWN: i64 = 5;
@@ -217,6 +219,7 @@ impl StackCache {
         cwd: &str,
         now_ms: i64,
         max_age_ms: i64,
+        budget: &Budget,
     ) -> Vec<ApiStack> {
         if let Some((at, stacks)) = self.repos.get(&repo) {
             let age = if stacks.is_some() {
@@ -233,11 +236,17 @@ impl StackCache {
                     .collect();
             }
         }
-        // `gh` fills in `{owner}/{repo}` from the directory's own remote.
-        let fetched =
-            crate::actions::run_for("gh", &["api", "repos/{owner}/{repo}/stacks"], cwd, TIMEOUT)
-                .ok()
-                .and_then(|json| parse_api(&json));
+        let fetched = sl_core::git::github_repo(cwd)
+            .and_then(|name| {
+                budget
+                    .secs(TIMEOUT_SECS)
+                    .and_then(|secs| {
+                        sl_core::gh::api::rest("GET", &format!("repos/{name}/stacks"), secs)
+                    })
+                    .and_then(sl_core::gh::api::Response::ok)
+                    .ok()
+            })
+            .and_then(|json| parse_api(&json));
         // A failed read keeps what was known, as a brief outage is not every
         // stack closing.
         let stacks = fetched.or_else(|| self.repos.get(&repo).and_then(|(_, s)| s.clone()));
@@ -260,6 +269,7 @@ impl StackCache {
         mut numbers: Vec<i64>,
         now_ms: i64,
         max_age_ms: i64,
+        budget: &Budget,
     ) -> HashMap<i64, EntryState> {
         numbers.sort_unstable();
         numbers.dedup();
@@ -277,7 +287,7 @@ impl StackCache {
         let fetched = if numbers.is_empty() {
             Some(HashMap::new())
         } else {
-            fetch_states(cwd, &numbers)
+            fetch_states(cwd, &numbers, budget)
         };
         // A PR GitHub is still working out leaves its last known state in
         // place: the answer has no news about it, only a gap.
@@ -310,6 +320,7 @@ pub fn build(
     cache: &mut StackCache,
     now_ms: i64,
     max_age_ms: i64,
+    budget: &Budget,
 ) -> Vec<StackView> {
     let all: HashSet<&str> = live
         .iter()
@@ -328,7 +339,7 @@ pub fn build(
     }
     let mut api: Vec<(PathBuf, ApiStack)> = Vec::new();
     for (repo, cwd) in &dirs {
-        let stacks = cache.open_stacks(repo.clone(), cwd, now_ms, max_age_ms);
+        let stacks = cache.open_stacks(repo.clone(), cwd, now_ms, max_age_ms, budget);
         api.extend(stacks.into_iter().map(|stack| (repo.clone(), stack)));
     }
     let mut views = assemble(live, closed, &repo_of, &api);
@@ -352,7 +363,7 @@ pub fn build(
         };
         known.insert(
             repo.clone(),
-            cache.pr_states(repo, cwd, numbers, now_ms, max_age_ms),
+            cache.pr_states(repo, cwd, numbers, now_ms, max_age_ms, budget),
         );
     }
     for view in &mut views {
@@ -375,7 +386,7 @@ fn apply_states(view: &mut StackView, states: &HashMap<i64, EntryState>) {
 }
 
 /// The states of `numbers`, PRs in the repository of `cwd`, in one call.
-fn fetch_states(cwd: &str, numbers: &[i64]) -> Option<HashMap<i64, EntryState>> {
+fn fetch_states(cwd: &str, numbers: &[i64], budget: &Budget) -> Option<HashMap<i64, EntryState>> {
     let fields: String = numbers.iter().fold(String::new(), |mut fields, n| {
         write!(fields, "p{n}: pullRequest(number: {n}) {{ number state isDraft merged isInMergeQueue mergeable mergeStateStatus }} ").ok();
         fields
@@ -383,23 +394,15 @@ fn fetch_states(cwd: &str, numbers: &[i64]) -> Option<HashMap<i64, EntryState>> 
     let query = format!(
         "query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ {fields}}} }}"
     );
-    // `gh` fills in `{owner}` and `{repo}` in field values too.
-    let json = crate::actions::run_for(
-        "gh",
-        &[
-            "api",
-            "graphql",
-            "-F",
-            "owner={owner}",
-            "-F",
-            "name={repo}",
-            "-f",
-            &format!("query={query}"),
-        ],
-        cwd,
-        TIMEOUT,
-    )
-    .ok()?;
+    let (owner, name) = sl_core::git::github_repo(cwd)?
+        .split_once('/')
+        .map(|(o, n)| (o.to_owned(), n.to_owned()))?;
+    let body = serde_json::json!({
+        "query": query,
+        "variables": { "owner": owner, "name": name },
+    })
+    .to_string();
+    let json = sl_core::gh::api::graphql(&body, budget.secs(TIMEOUT_SECS).ok()?).ok()?;
     parse_states(&json)
 }
 

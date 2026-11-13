@@ -327,6 +327,7 @@ impl CompactPopover {
         // An accessory app is not active until asked, and a transient popover
         // of an inactive app does not close on a click elsewhere.
         NSApplication::sharedApplication(mtm).activate();
+        crate::sessions::looked();
         self.popover.showRelativeToRect_ofView_preferredEdge(
             button.bounds(),
             button,

@@ -509,11 +509,21 @@ pub(crate) fn pr_pills(info: &sl_core::gh::GhInfo, place: PillsFor) -> (Vec<Pill
             pill(format!("CI … {} running", ci.pending), Tone::Yellow)
         }
         sl_core::gh::CiState::Pending => pill(format!("CI … {}", ci.pending), Tone::Yellow),
+        // A failure past the checks read has no name to count.
+        sl_core::gh::CiState::Failing if ci.failed.is_empty() => pill("CI ✗", Tone::Red),
         sl_core::gh::CiState::Failing if card => {
             pill(format!("CI ✗ {} failed", ci.failed.len()), Tone::Red)
         }
         sl_core::gh::CiState::Failing => pill(format!("CI ✗ {}", ci.failed.len()), Tone::Red),
     });
+    // Long past when it was due again: nothing is asking GitHub about it.
+    let ci = match (ci, info.old_for_ms(crate::snapshot::now_ms())) {
+        (Some(ci), Some(age)) => Some(pill(
+            format!("{} · {} old", ci.text, sl_core::format::ago_short(age)),
+            Tone::Dim,
+        )),
+        (ci, _) => ci,
+    };
     (pills, ci)
 }
 
@@ -1126,7 +1136,8 @@ mod tests {
     #[test]
     fn a_session_with_no_pr_has_its_branch_in_the_header() {
         let mut session = crate::fixture::load("full").unwrap().open.remove(0);
-        session.gh = None;
+        // GitHub answered: no PR.
+        session.gh = Some(sl_core::gh::GhInfo::default());
         session.linear = None;
         session.branch = Some("feat/x".into());
         let header = header_content(&session);

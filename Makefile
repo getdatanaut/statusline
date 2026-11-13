@@ -1,7 +1,8 @@
 # statusline: build, test, and install the menu bar tray as a login item.
 #
-#   make install     build, bundle, sign, register, and (re)load the LaunchAgent
-#   make uninstall   unload the LaunchAgent and remove the app and the plist
+#   make signing-cert  once per Mac: a self-signed identity to sign the tray with
+#   make install       build, bundle, sign, register, and (re)load the LaunchAgent
+#   make uninstall     unload the LaunchAgent and remove the app and the plist
 #
 # The tray is installed as an app bundle, not a bare binary: macOS only
 # delivers native notifications to a signed bundle that LaunchServices knows
@@ -19,10 +20,13 @@ DOMAIN     := gui/$(shell id -u)
 STAGE      := target/app-stage/Statusline Tray.app
 LSREGISTER := /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 PACKAGING  := crates/sl-tray/packaging
-# Ad-hoc by default. A self-signed code-signing identity also works.
-SIGN_ID    ?= -
+# The identity `make signing-cert` creates. Signing with the same one every
+# build keeps the tray's access to its GitHub token in the Keychain; ad-hoc
+# signing (`-`, used when there is none) makes every build a new app to it.
+CERT_NAME  := Statusline Dev
+SIGN_ID    ?= $(shell security find-identity -p codesigning 2>/dev/null | grep -q '"$(CERT_NAME)"' && echo '$(CERT_NAME)' || echo -)
 
-.PHONY: build test fmt lint run icon install uninstall restart logs
+.PHONY: build test fmt lint run icon signing-cert install uninstall restart logs
 
 build:
 	cargo build --release -p sl-tray
@@ -47,7 +51,11 @@ icon:
 	swift $(PACKAGING)/make-icon.swift target/AppIcon.iconset
 	iconutil -c icns target/AppIcon.iconset -o $(PACKAGING)/AppIcon.icns
 
+signing-cert:
+	$(PACKAGING)/make-signing-cert.sh '$(CERT_NAME)'
+
 install: build
+	@[ '$(SIGN_ID)' != '-' ] || echo "warning: signing ad-hoc; run 'make signing-cert' once, or every build will have to be allowed the GitHub token again"
 	# Assemble and sign a staged bundle: never rewrite a running signed binary
 	# in place (macOS can SIGKILL it with "Code Signature Invalid").
 	rm -rf "$(STAGE)"
@@ -56,7 +64,10 @@ install: build
 	cp $(PACKAGING)/Info.plist "$(STAGE)/Contents/Info.plist"
 	cp $(PACKAGING)/AppIcon.icns "$(STAGE)/Contents/Resources/AppIcon.icns"
 	cp target/release/statusline-tray "$(STAGE)/Contents/MacOS/statusline-tray"
-	codesign --force --sign '$(SIGN_ID)' --identifier $(LABEL) "$(STAGE)"
+	# Hardened runtime: no injected libraries or debugger, so nothing can
+	# borrow the tray's signature to read its Keychain item. With
+	# `make signing-cert`'s key this asks for your login password.
+	codesign --force --options runtime --sign '$(SIGN_ID)' --identifier $(LABEL) "$(STAGE)"
 	-launchctl bootout $(DOMAIN)/$(LABEL) 2>/dev/null; \
 		for i in 1 2 3 4 5 6 7 8 9 10; do \
 			launchctl print $(DOMAIN)/$(LABEL) >/dev/null 2>&1 || break; sleep 0.3; \

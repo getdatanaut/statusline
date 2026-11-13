@@ -8,4 +8,4 @@ pub mod state;
 pub use sl_core::ansi;
 pub use sl_core::format;
 pub use sl_core::types;
-pub use sl_core::{gh, git};
+pub use sl_core::{gh, git, process};

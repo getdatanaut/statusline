@@ -1,11 +1,9 @@
 //! A PR's review feedback as markdown: its reviews, review threads and
 //! conversation, distilled for reading or handing to an agent.
 //!
-//! A port of the `gh-pr-feedback` script, so the tray needs nothing but `gh`.
-//! The markdown is the script's, line for line; only the fetching differs:
-//! `gh` fills in the repository from the directory it runs in.
-
-use std::time::Duration;
+//! A port of the `gh-pr-feedback` script, so the tray needs no script. The
+//! markdown is the script's, line for line; only the fetching differs: the
+//! repository is the directory's `origin`, asked with the stored token.
 
 use serde_json::Value;
 
@@ -13,8 +11,8 @@ use serde_json::Value;
 const PAGE: u32 = 100;
 /// How many lines of a thread's diff hunk are shown, after its header.
 const HUNK_TAIL_LINES: usize = 12;
-/// One GraphQL call is abandoned after this long.
-const TIMEOUT: Duration = Duration::from_secs(60);
+/// One GraphQL call is abandoned after this many seconds.
+const TIMEOUT_SECS: u64 = 60;
 
 const PR_META_FIELDS: &str = "number title url isDraft state baseRefName headRefName reviewDecision author{login __typename}";
 const COMMENT_FIELDS: &str =
@@ -207,33 +205,30 @@ fn compare_threads(a: &Thread, b: &Thread) -> std::cmp::Ordering {
 // Fetching
 // --------------------------------------------------------------------------
 
-/// Every node of `connection` on PR `number`, page by page, and the PR itself.
+/// Every node of `connection` on PR `number` of `repo` (`owner/name`), page
+/// by page, and the PR itself.
 fn fetch_all(
-    cwd: &str,
+    repo: &str,
     number: i64,
     connection: &str,
     fields: &str,
 ) -> Result<(Value, Vec<Value>), String> {
+    let (owner, name) = repo
+        .split_once('/')
+        .ok_or_else(|| format!("not owner/name: {repo}"))?;
     let query = page_query(connection, fields);
     let mut nodes = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
-        let mut args = vec![
-            "api".to_owned(),
-            "graphql".to_owned(),
-            "-f".to_owned(),
-            format!("query={query}"),
-        ];
-        // `gh` fills in `{owner}` and `{repo}` from the directory's own remote.
-        args.extend(["-F", "owner={owner}", "-F", "name={repo}", "-F"].map(str::to_owned));
-        args.push(format!("number={number}"));
-        if let Some(cursor) = &cursor {
-            args.extend(["-f".to_owned(), format!("cursor={cursor}")]);
-        }
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        let response: Value =
-            serde_json::from_str(&crate::actions::run_for("gh", &args, cwd, TIMEOUT)?)
-                .map_err(|error| format!("unreadable GraphQL response: {error}"))?;
+        let body = serde_json::json!({
+            "query": query,
+            "variables": { "owner": owner, "name": name, "number": number, "cursor": cursor },
+        })
+        .to_string();
+        let response: Value = serde_json::from_str(
+            &sl_core::gh::api::graphql(&body, TIMEOUT_SECS).map_err(|f| f.to_string())?,
+        )
+        .map_err(|error| format!("unreadable GraphQL response: {error}"))?;
         if let Some(errors) = response
             .get("errors")
             .and_then(Value::as_array)
@@ -270,9 +265,11 @@ fn fetch_all(
 }
 
 fn fetch_digest(cwd: &str, number: i64) -> Result<Digest, String> {
-    let (meta, threads) = fetch_all(cwd, number, "reviewThreads", &thread_fields())?;
-    let (_, reviews) = fetch_all(cwd, number, "reviews", REVIEW_FIELDS)?;
-    let (_, conversation) = fetch_all(cwd, number, "comments", COMMENT_FIELDS)?;
+    let repo = sl_core::git::github_repo(cwd)
+        .ok_or_else(|| format!("{cwd} has no GitHub remote named origin"))?;
+    let (meta, threads) = fetch_all(&repo, number, "reviewThreads", &thread_fields())?;
+    let (_, reviews) = fetch_all(&repo, number, "reviews", REVIEW_FIELDS)?;
+    let (_, conversation) = fetch_all(&repo, number, "comments", COMMENT_FIELDS)?;
     let mut threads: Vec<Thread> = threads.iter().map(to_thread).collect();
     threads.sort_by(compare_threads);
     Ok(Digest {

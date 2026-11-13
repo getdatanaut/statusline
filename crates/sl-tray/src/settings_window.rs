@@ -1,4 +1,4 @@
-//! The Settings window, opened by the gear in either layout's footer, in three
+//! The Settings window, opened by the gear in either layout's footer, in four
 //! tabs:
 //!
 //! ```text
@@ -12,11 +12,14 @@
 //!   Flags       Needs you, Cache warning, Context ring
 //! Notifications
 //!   one switch per kind
+//! Integrations
+//!   GitHub      the account, the token field, Create token…, Remove, Save
 //! ```
 //!
 //! A window rather than a menu: a menu bar app cannot reliably open a second
 //! menu from a click in its first, and a window can hold more than choices.
-//! Every control acts at once; there is nothing to apply or save.
+//! Every control acts at once; there is nothing to apply or save, but for
+//! the GitHub token, which is saved with its own button.
 
 use std::rc::Rc;
 
@@ -27,7 +30,7 @@ use objc2_app_kit::{
     NSAccessibility, NSApplication, NSBox, NSBoxType, NSButton, NSColor, NSControlSize,
     NSControlStateValueOff, NSControlStateValueOn, NSFont, NSImage, NSImageView,
     NSMutableParagraphStyle, NSPopUpButton, NSSlider, NSSplitViewController, NSSplitViewItem,
-    NSSwitch, NSTabView, NSTabViewType, NSTextAlignment, NSTextField, NSTitlePosition, NSToolbar,
+    NSSecureTextField, NSSwitch, NSTabView, NSTabViewType, NSTextAlignment, NSTextField, NSTitlePosition, NSToolbar,
     NSView, NSViewController, NSWindow, NSWindowStyleMask, NSWindowTitleVisibility,
     NSWindowToolbarStyle,
 };
@@ -58,6 +61,10 @@ const ROW_INSET: f64 = 14.0;
 const ROW_PAD: f64 = 9.0;
 const MIN_ROW: f64 = 38.0;
 const POPUP_WIDTH: f64 = 130.0;
+/// The GitHub token field, and the account line over it.
+const TOKEN_WIDTH: f64 = 200.0;
+/// The GitHub account line.
+const ACCOUNT_WIDTH: f64 = 280.0;
 
 /// Everything the controls show: the settings in use.
 pub(crate) struct SettingsState {
@@ -96,6 +103,8 @@ pub(crate) struct SettingsWindow {
     cache_lead: Retained<NSPopUpButton>,
     ring: Retained<NSPopUpButton>,
     notify: Vec<Retained<NSSwitch>>,
+    /// Keeps the GitHub account line in step with [`crate::integrations`].
+    _github_timer: sl_macos::timer::RepeatingTimer,
 }
 
 /// Lays grouped cards down one column of a tab, as System Settings does: a
@@ -491,7 +500,69 @@ impl SettingsWindow {
             .collect();
         alerts.end_card();
 
-        let height = [general.finish(), list.finish(), alerts.finish()]
+        // ---- Integrations
+        let mut links = Page::new(mtm);
+        links.heading("GitHub");
+        links.begin_card();
+        let account = NSTextField::labelWithString(&NSString::from_str(""), mtm);
+        account.setAlignment(NSTextAlignment::Right);
+        account.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        // Wider than the field: `GitHub refused the token: expired or revoked`.
+        account.setFrameSize(NSSize::new(ACCOUNT_WIDTH, 18.0));
+        links.row("Account", None, &account);
+        let field = NSSecureTextField::new(mtm);
+        field.setPlaceholderString(Some(&NSString::from_str("ghp_… or github_pat_…")));
+        field.setFrameSize(NSSize::new(TOKEN_WIDTH, 22.0));
+        links.row(
+            "Token",
+            Some("A classic token with the repo and read:org scopes. Kept in your login Keychain."),
+            &field,
+        );
+        let create = sl_macos::controls::button(mtm, "Create token…");
+        let remove = sl_macos::controls::button(mtm, "Remove");
+        let save = sl_macos::controls::button(mtm, "Save");
+        let mut x = 0.0;
+        let mut buttons_height: f64 = 0.0;
+        for button in [&create, &remove, &save] {
+            button.sizeToFit();
+            button.setFrameOrigin(NSPoint::new(x, 0.0));
+            x += button.frame().size.width + 8.0;
+            buttons_height = buttons_height.max(button.frame().size.height);
+        }
+        let holder = NSView::initWithFrame(
+            mtm.alloc(),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(x - 8.0, buttons_height)),
+        );
+        holder.addSubview(&create);
+        holder.addSubview(&remove);
+        holder.addSubview(&save);
+        links.row("", None, &holder);
+        links.end_card();
+        {
+            let field = field.clone();
+            sl_macos::action::bind(&save, move |_| {
+                let token = field.stringValue().to_string();
+                field.setStringValue(&NSString::from_str(""));
+                crate::integrations::save(&token);
+            });
+        }
+        sl_macos::action::bind(&remove, |_| crate::integrations::remove());
+        sl_macos::action::bind(&create, |_| {
+            crate::actions::open_url(crate::integrations::NEW_TOKEN_URL);
+        });
+        let github_timer = {
+            let account = account.clone();
+            let mut shown = None;
+            sl_macos::timer::RepeatingTimer::common_modes(0.5, 0.25, move || {
+                let (count, state) = crate::integrations::github();
+                if shown != Some(count) {
+                    shown = Some(count);
+                    account.setStringValue(&NSString::from_str(&state.text()));
+                }
+            })
+        };
+
+        let height = [general.finish(), list.finish(), alerts.finish(), links.finish()]
             .into_iter()
             .fold(0.0, f64::max);
         let tabs = NSTabView::initWithFrame(
@@ -503,6 +574,7 @@ impl SettingsWindow {
             ("General", "gearshape", general),
             ("Sessions", "rectangle.stack", list),
             ("Notifications", "bell", alerts),
+            ("Integrations", "key", links),
         ];
         let mut sidebar = Vec::new();
         for (name, symbol, page) in pages {
@@ -543,6 +615,7 @@ impl SettingsWindow {
             NSColor::systemGrayColor(),
             NSColor::systemBlueColor(),
             NSColor::systemRedColor(),
+            NSColor::systemGreenColor(),
         ];
         let buttons: Vec<Retained<NSButton>> = sidebar
             .iter()
@@ -667,12 +740,14 @@ impl SettingsWindow {
             cache_lead,
             ring,
             notify,
+            _github_timer: github_timer,
         }
     }
 
     /// Bring the window forward, its controls showing the settings in use.
     pub(crate) fn show(&self, state: &SettingsState) {
         self.sync(state);
+        crate::integrations::refresh();
         NSApplication::sharedApplication(self.window.mtm()).activate();
         self.window.makeKeyAndOrderFront(None);
     }
@@ -797,7 +872,7 @@ pub(crate) fn preview(path: &str) -> bool {
     objc2_app_kit::NSAppearanceCustomization::setAppearance(backdrop_view, dark.as_deref());
     backdrop.addSubview(&content);
     let stem = path.strip_suffix(".png").unwrap_or(path);
-    ["general", "sessions", "notifications"]
+    ["general", "sessions", "notifications", "integrations"]
         .iter()
         .enumerate()
         .all(|(i, name)| {

@@ -6,6 +6,10 @@ edition.workspace = true
 [dependencies]
 dirs = "6.0.0"
 owo-colors = "4.3.0"
+# The PR store (`gh::store`). Not `bundled`: the status line links macOS's
+# own SQLite instead of carrying a copy (2.7 MB against 0.8 MB). The tray
+# gets the bundled one through `sl-usage`, as features unify.
+rusqlite = "0.41"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 unicode-width = "0.2"

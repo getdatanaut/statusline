@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::process::Command;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -125,6 +125,19 @@ impl Bell {
 
 /// Rung when a transcript changes: the usage numbers are refreshed.
 pub static USAGE_BELL: Bell = Bell::new();
+
+/// Set when the menu or the Compact popover opens, until the next pass asks
+/// GitHub with [`LOOK_FRESH_MS`].
+static LOOKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// When someone looks, PR answers older than this are asked about again.
+const LOOK_FRESH_MS: i64 = 30_000;
+
+/// The menu or the Compact popover opened: have the sessions looked at now,
+/// and their PRs asked about if what is known of them is not fresh.
+pub fn looked() {
+    LOOKED.store(true, Ordering::Relaxed);
+    SESSIONS_BELL.ring();
+}
 /// Rung when Claude Code's session records or Codex's rollouts change: the
 /// open sessions are read again.
 pub static SESSIONS_BELL: Bell = Bell::new();
@@ -139,9 +152,6 @@ const SESSIONS_GAP: u64 = 3;
 const SESSIONS_BACKSTOP: u64 = 15;
 /// `claude agents --json` is a local call; anything slower is stuck.
 const AGENTS_TIMEOUT: Duration = Duration::from_secs(10);
-/// A branch with no PR is asked about this many times less often than one
-/// with a PR, so it is not polled every minute for the life of the session.
-const NO_PR_SLOWDOWN: i64 = 5;
 /// Rows reserved in the menu: more than are ever open at once in practice.
 pub const MAX_SESSIONS: usize = 16;
 /// Reviewer rows reserved in a session's submenu.
@@ -544,8 +554,8 @@ fn claude_half(
 
 /// What is open, from local files alone -- no network -- so it can be shown
 /// at once: Claude Code's session records (or `claude agents`), Codex's
-/// rollouts, each directory's branch, the PR state the status line last
-/// cached, whatever Linear said before. [`ask_network`] brings the rest.
+/// rollouts, each directory's branch, the PR state last stored, whatever
+/// Linear said before. [`ask_linear`] and [`GithubRound`] bring the rest.
 /// `None` when `claude agents` could not be run or parsed and there are no
 /// Codex sessions to list instead, so the caller keeps the list it already
 /// has rather than flashing an empty one.
@@ -577,28 +587,14 @@ pub fn load(
     if let (Some(codex), Some(home)) = (codex, codex_home) {
         sessions.extend(codex.load(&home));
     }
-    let cache_dir = gh::default_cache_dir();
-    let now = crate::snapshot::now_ms();
-    let pr_age = i64::try_from(crate::view_prefs::load_poll().pr_secs)
-        .unwrap_or(i64::MAX)
-        .saturating_mul(1000);
+    let store = gh::Store::open_default();
     for session in &mut sessions {
         let cwd = session.cwd.as_str();
         session.branch = sl_core::git::current_branch(Some(cwd));
-        session.gh = session
-            .branch
-            .as_deref()
-            .and_then(|branch| gh::load_cached(&cache_dir, cwd, branch));
-        // A "no PR" this run has not itself confirmed, and old enough that
-        // the PR may exist by now (a session reopened later), is not shown as
-        // fact until it has been asked about again.
-        if let Some(info) = session.gh.as_mut().filter(|info| info.pr_number.is_none()) {
-            info.unconfirmed = !miss_confirmed(
-                previous,
-                session.session_id.as_str(),
-                session.branch.as_deref(),
-            ) && now - info.fetched_ms >= pr_age;
-        }
+        session.gh = store
+            .as_ref()
+            .zip(session.branch.as_deref())
+            .and_then(|(store, branch)| gh::load(store, cwd, branch));
         session.linear = linear
             .zip(session.branch.as_deref())
             .and_then(|(cache, branch)| cache.cached(branch));
@@ -644,25 +640,6 @@ pub enum Arrival {
 /// and a directory to ask from.
 type Asks = Vec<(String, String)>;
 
-/// Whether the last pass already asked GitHub and was told this branch had no PR.
-fn miss_confirmed(previous: &[OpenSession], session_id: &str, branch: Option<&str>) -> bool {
-    previous.iter().any(|s| {
-        s.session_id == session_id
-            && s.branch.as_deref() == branch
-            && s.gh
-                .as_ref()
-                .is_some_and(|g| g.pr_number.is_none() && !g.unconfirmed)
-    })
-}
-
-fn cached_is_known_miss(
-    known: &std::collections::HashSet<(String, String)>,
-    cwd: &str,
-    branch: &str,
-) -> bool {
-    known.contains(&(cwd.to_owned(), branch.to_owned()))
-}
-
 /// What to ask the network about `sessions`: each directory with its branch,
 /// and each ticket that is due, with a directory to ask from.
 pub fn network_asks(
@@ -699,63 +676,155 @@ pub fn network_asks(
     (dirs, tickets)
 }
 
-/// Ask GitHub about every directory and Linear about every ticket, all at
-/// once, and hand each answer to `arrived` as it comes -- GitHub's whole,
-/// Linear's whole -- so a slow or unreachable one holds back only itself.
-/// A PR result the status line cached recently enough is reused without
-/// asking (see [`gh::load_or_fetch`]).
-pub fn ask_network(
-    dirs: &[(String, String)],
+/// Ask Linear about every ticket, all at once, and hand the answers to
+/// `arrived`. GitHub is asked apart, by [`GithubRound`], so it never holds a
+/// pass up.
+pub fn ask_linear(
     tickets: &[(String, String)],
-    ask_gh: impl Fn(&str, &str) -> Option<GhInfo> + Sync,
-    ask_linear: impl Fn(&str, &str) -> Option<crate::linear::LinearInfo> + Sync,
-    mut arrived: impl FnMut(Arrival),
+    ask: impl Fn(&str, &str) -> Option<crate::linear::LinearInfo> + Sync,
+    arrived: impl FnOnce(Arrival),
 ) {
-    std::thread::scope(|scope| {
-        let (sender, arrivals) = std::sync::mpsc::channel();
-        let gh_sender = sender.clone();
-        let ask_gh = &ask_gh;
-        scope.spawn(move || {
-            let keys: std::collections::BTreeSet<&str> =
-                dirs.iter().map(|(cwd, _)| cwd.as_str()).collect();
-            let branch_of: HashMap<&str, &str> = dirs
-                .iter()
-                .map(|(cwd, branch)| (cwd.as_str(), branch.as_str()))
-                .collect();
-            let found = each_dir(
-                &keys,
-                |cwd| branch_of.get(cwd).and_then(|branch| ask_gh(cwd, branch)),
-                |_| None,
-            );
-            gh_sender.send(Arrival::Gh(found)).ok();
-        });
-        if !tickets.is_empty() {
-            let ask_linear = &ask_linear;
-            let linear_sender = sender.clone();
-            scope.spawn(move || {
-                let keys: std::collections::BTreeSet<&str> =
-                    tickets.iter().map(|(id, _)| id.as_str()).collect();
-                let cwd_of: HashMap<&str, &str> = tickets
-                    .iter()
-                    .map(|(id, cwd)| (id.as_str(), cwd.as_str()))
-                    .collect();
-                let found = each_dir(
-                    &keys,
-                    |id| cwd_of.get(id).and_then(|cwd| ask_linear(id, cwd)),
-                    |_| None,
-                );
-                linear_sender
-                    .send(Arrival::Linear(found.into_iter().collect()))
-                    .ok();
+    if tickets.is_empty() {
+        return;
+    }
+    let keys: std::collections::BTreeSet<&str> =
+        tickets.iter().map(|(id, _)| id.as_str()).collect();
+    let cwd_of: HashMap<&str, &str> = tickets
+        .iter()
+        .map(|(id, cwd)| (id.as_str(), cwd.as_str()))
+        .collect();
+    let found = each_dir(
+        &keys,
+        |id| cwd_of.get(id).and_then(|cwd| ask(id, cwd)),
+        |_| None,
+    );
+    arrived(Arrival::Linear(found.into_iter().collect()));
+}
+
+/// The longest one round of GitHub requests may take, all of them together.
+const GITHUB_ROUND: Duration = Duration::from_mins(1);
+
+/// GitHub's part of the passes, on a thread of its own: the PRs of the
+/// sessions' branches, then the stacks they are on. One round at a time; a
+/// pass that comes while one is under way starts none. A round stores what
+/// GitHub said (the next pass reads it back) and keeps the stacks it found,
+/// then rings [`SESSIONS_BELL`] if anything changed, so it is shown at once.
+#[derive(Clone, Default)]
+struct GithubRound {
+    busy: Arc<AtomicBool>,
+    stacks: Arc<Mutex<Option<Vec<crate::stacks::StackView>>>>,
+    cache: Arc<Mutex<crate::stacks::StackCache>>,
+}
+
+/// What a round is asked about.
+struct RoundAsks {
+    dirs: Vec<(String, String)>,
+    sessions: Vec<OpenSession>,
+    gone: Vec<crate::sticky::Remembered>,
+    now_ms: i64,
+    policy: gh::Policy,
+    pr_age_ms: i64,
+}
+
+impl GithubRound {
+    fn is_busy(&self) -> bool {
+        self.busy.load(Ordering::SeqCst)
+    }
+
+    /// Start a round unless one is under way. `fresh_ms`: see [`gh::sync`].
+    fn start(&self, asks: RoundAsks, fresh_ms: Option<i64>) {
+        if self.busy.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let round = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("github".into())
+            .spawn(move || {
+                let changed = round.run(asks, fresh_ms);
+                round.busy.store(false, Ordering::SeqCst);
+                if changed {
+                    SESSIONS_BELL.ring();
+                }
             });
+        if spawned.is_err() {
+            self.busy.store(false, Ordering::SeqCst);
         }
-        // Both senders above are clones: drop the original, so the loop ends
-        // once every answer is in.
-        drop(sender);
-        for arrival in arrivals {
-            arrived(arrival);
+    }
+
+    /// One round; whether it learned anything new.
+    fn run(&self, asks: RoundAsks, fresh_ms: Option<i64>) -> bool {
+        let RoundAsks {
+            dirs,
+            mut sessions,
+            gone,
+            now_ms,
+            policy,
+            pr_age_ms,
+        } = asks;
+        let budget = gh::api::Budget::new(GITHUB_ROUND);
+        let post = |body: &str| gh::api::post_within(&budget, body);
+        let before: Vec<Option<GhInfo>> = sessions.iter().map(|s| s.gh.clone()).collect();
+        // A store that cannot be opened answers nothing, and what the
+        // sessions show stays as it is. Without a token GitHub accepts, the
+        // tray asks nothing (the status line asks by itself meanwhile, and
+        // a claim taken only to fail would keep it out) and reads what is
+        // stored.
+        if let Some(store) = gh::Store::open_default() {
+            let found = if gh::api::can_ask() {
+                let seen = store.seen_since(now_ms - gh::sync::SEEN_FOR_MS);
+                gh::sync(
+                    &store,
+                    &post,
+                    &with_seen(dirs, seen),
+                    now_ms,
+                    &policy,
+                    fresh_ms,
+                )
+            } else {
+                dirs.iter()
+                    .map(|(dir, branch)| (dir.clone(), gh::load(&store, dir, branch)))
+                    .collect()
+            };
+            apply_arrival(&mut sessions, Arrival::Gh(found), None, now_ms);
         }
-    });
+        let prs_changed = sessions.iter().map(|s| &s.gh).ne(before.iter());
+        let found = {
+            let mut cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::stacks::build(&sessions, &gone, &mut cache, now_ms, pr_age_ms, &budget)
+        };
+        let mut stacks = self
+            .stacks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stacks_changed = stacks.as_ref() != Some(&found);
+        *stacks = Some(found);
+        prs_changed || stacks_changed
+    }
+
+    /// The stacks the last round found; `None` before the first.
+    fn stacks(&self) -> Option<Vec<crate::stacks::StackView>> {
+        self.stacks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// The sessions' (directory, branch) pairs, then those the status line
+/// showed in directories no session is in. Answers come back by directory,
+/// so a session's own directory keeps its own branch: the status line may
+/// have shown another there (Claude Code's worktree branch, or HEAD before
+/// it moved).
+fn with_seen(mut dirs: Asks, seen: Asks) -> Asks {
+    for (dir, branch) in seen {
+        if !dirs.iter().any(|(known, _)| *known == dir) {
+            dirs.push((dir, branch));
+        }
+    }
+    dirs
 }
 
 /// Fold `arrival` into `sessions` (and `linear`'s cache).
@@ -856,7 +925,7 @@ pub fn spawn(
             let mut linear = crate::linear::LinearCache::default();
             let mut codex = crate::codex_sessions::CodexSessions::default();
             let mut exists = crate::sticky::ExistsCache::default();
-            let mut stack_cache = crate::stacks::StackCache::default();
+            let github = GithubRound::default();
             let mut stack_watcher = crate::notify::StackWatcher::default();
             let mut claude = ClaudeLister::default();
             let mut projects: HashMap<String, String> = HashMap::new();
@@ -930,51 +999,38 @@ pub fn spawn(
                     crate::trace(&format!("published {} open sessions", sessions.len()));
                     let (dirs, tickets) =
                         network_asks(&sessions, show_linear.then_some(&linear), now, poll.pr_secs);
-                    let cache_dir = gh::default_cache_dir();
-                    // Branches this run already found to have no PR: those may be
-                    // asked about less often. Any other old "no PR" is asked now.
-                    let known_misses: std::collections::HashSet<(String, String)> = previous
-                        .open
-                        .iter()
-                        .filter(|s| {
-                            miss_confirmed(&previous.open, &s.session_id, s.branch.as_deref())
-                        })
-                        .filter_map(|s| Some((s.cwd.clone(), s.branch.clone()?)))
-                        .collect();
-                    ask_network(
-                        &dirs,
-                        &tickets,
-                        |cwd, branch| {
-                            let slow = cached_is_known_miss(&known_misses, cwd, branch);
-                            let max_age = move |cached: &GhInfo| {
-                                pr_age.saturating_mul(if cached.pr_number.is_none() && slow {
-                                    NO_PR_SLOWDOWN
-                                } else {
-                                    1
-                                })
-                            };
-                            gh::load_or_fetch(&cache_dir, cwd, branch, now, max_age)
-                        },
-                        crate::linear::fetch,
-                        |arrival| {
-                            crate::trace(&format!(
-                                "arrived: {}",
-                                match &arrival {
-                                    Arrival::Gh(_) => "GitHub",
-                                    Arrival::Linear(_) => "Linear",
-                                }
-                            ));
-                            apply_arrival(
-                                &mut sessions,
-                                arrival,
-                                show_linear.then_some(&mut linear),
-                                now,
-                            );
-                            publish(&board, &sticky, &sessions, &gone, previous.stacks.clone());
-                        },
-                    );
-                    let found =
-                        crate::stacks::build(&sessions, &gone, &mut stack_cache, now, pr_age);
+                    // GitHub, on its own thread, one round at a time; what it
+                    // learns is stored, and shown from the next pass on. The
+                    // PR setting is how often an active branch (pushed lately,
+                    // its checks running) is asked about. A look (the menu
+                    // opening) waits for a round that can take it.
+                    if !github.is_busy() {
+                        let fresh = LOOKED
+                            .swap(false, Ordering::Relaxed)
+                            .then_some(LOOK_FRESH_MS);
+                        github.start(
+                            RoundAsks {
+                                dirs,
+                                sessions: sessions.clone(),
+                                gone: gone.clone(),
+                                now_ms: now,
+                                policy: gh::Policy::active_every(pr_age),
+                                pr_age_ms: pr_age,
+                            },
+                            fresh,
+                        );
+                    }
+                    ask_linear(&tickets, crate::linear::fetch, |arrival| {
+                        crate::trace("arrived: Linear");
+                        apply_arrival(
+                            &mut sessions,
+                            arrival,
+                            show_linear.then_some(&mut linear),
+                            now,
+                        );
+                        publish(&board, &sticky, &sessions, &gone, previous.stacks.clone());
+                    });
+                    let found = github.stacks().unwrap_or_else(|| previous.stacks.clone());
                     // Read each pass, so a change in Settings applies at once.
                     let wanted = crate::view_prefs::load_notify();
                     let tuning = crate::view_prefs::load_tuning();
@@ -1273,7 +1329,8 @@ pub fn row_detail(session: &OpenSession, now_ms: i64) -> Vec<Seg> {
             }
         }
         if let Some(ci) = &info.ci {
-            details.push(match ci.state {
+            let old_for = info.old_for_ms(now_ms);
+            let mut ci = match ci.state {
                 CiState::Passing => seg("✓", Tone::Green),
                 CiState::Pending => seg("CI …", Tone::Yellow),
                 CiState::Failing => seg(
@@ -1283,7 +1340,15 @@ pub fn row_detail(session: &OpenSession, now_ms: i64) -> Vec<Seg> {
                     ),
                     Tone::Red,
                 ),
-            });
+            };
+            // Long past when it was due again: nothing is asking GitHub.
+            if let Some(age) = old_for {
+                ci = seg(
+                    format!("{} {} old", ci.text, sl_core::format::ago_short(age)),
+                    Tone::Dim,
+                );
+            }
+            details.push(ci);
         }
     }
     if session.remote_control.is_some() {
@@ -1522,6 +1587,10 @@ pub enum NoPr {
     NoneYet,
     /// An old "none" that is being asked about again: it may have one now.
     Checking,
+    /// Not asked about, as no GitHub token is stored.
+    NoToken,
+    /// Not asked about, as GitHub refused the token (expired, revoked).
+    TokenRefused,
 }
 
 impl NoPr {
@@ -1533,6 +1602,8 @@ impl NoPr {
             NoPr::DefaultBranch => "Default branch · no PR",
             NoPr::NoneYet => "No open PR for this branch",
             NoPr::Checking => "Checking for a PR…",
+            NoPr::NoToken => "No GitHub token · add one in Settings",
+            NoPr::TokenRefused => "GitHub token expired or revoked · replace it in Settings",
         }
     }
 
@@ -1541,6 +1612,8 @@ impl NoPr {
         match self {
             NoPr::NoneYet => "No PR yet",
             NoPr::Checking => "Checking PR…",
+            NoPr::NoToken => "No GitHub token",
+            NoPr::TokenRefused => "GitHub token expired",
             other => other.text(),
         }
     }
@@ -1559,7 +1632,11 @@ pub fn no_pr(session: &OpenSession) -> Option<NoPr> {
         None => NoPr::NotARepository,
         Some(branch) if branch.starts_with('@') => NoPr::DetachedHead,
         Some(branch) if !gh::worth_fetching(branch) => NoPr::DefaultBranch,
-        Some(_) if session.gh.as_ref().is_some_and(|info| info.unconfirmed) => NoPr::Checking,
+        // Not asked about yet, and no way to ask.
+        Some(_) if session.gh.is_none() && gh::api::token_missing() => NoPr::NoToken,
+        Some(_) if session.gh.is_none() && gh::api::token_refused() => NoPr::TokenRefused,
+        // Not asked about yet: the first answer is on its way.
+        Some(_) if session.gh.is_none() => NoPr::Checking,
         Some(_) => NoPr::NoneYet,
     })
 }
@@ -2346,25 +2423,13 @@ mod tests {
     }
 
     #[test]
-    fn an_old_miss_reads_as_checking_and_a_confirmed_one_as_none_yet() {
+    fn a_branch_not_asked_about_yet_reads_as_checking_and_an_answered_one_as_none_yet() {
         let mut s = session("sl", Activity::Idle);
         s.branch = Some("feat/x".into());
-        s.gh = Some(GhInfo {
-            unconfirmed: true,
-            ..GhInfo::default()
-        });
+        s.gh = None;
         assert_eq!(no_pr(&s), Some(NoPr::Checking));
         s.gh = Some(GhInfo::default());
         assert_eq!(no_pr(&s), Some(NoPr::NoneYet));
-        assert!(
-            !miss_confirmed(&[], "sl", Some("feat/x")),
-            "nothing was asked yet"
-        );
-        assert!(miss_confirmed(&[s.clone()], "sl", Some("feat/x")));
-        assert!(
-            !miss_confirmed(&[s], "sl", Some("feat/y")),
-            "another branch is not confirmed"
-        );
     }
 
     #[test]
@@ -2386,6 +2451,8 @@ mod tests {
         };
         let mut s = session("sl", Activity::Busy);
         s.branch = Some("feat/x".into());
+        // GitHub answered: no PR.
+        s.gh = Some(GhInfo::default());
         assert_eq!(
             no_pr(&s).map(NoPr::text),
             Some("No open PR for this branch")
@@ -2834,80 +2901,60 @@ mod tests {
         }
     }
 
-    /// The order answers arrive in, with one side held until the other is in.
-    fn arrivals(gh_waits: bool) -> Vec<&'static str> {
-        let dirs = vec![("/a".to_owned(), "jakub/dn-1-x".to_owned())];
-        let tickets = vec![("DN-1".to_owned(), "/a".to_owned())];
-        let (gh_in, linear_in) = (
-            std::sync::atomic::AtomicBool::new(false),
-            std::sync::atomic::AtomicBool::new(false),
+    #[test]
+    fn linear_is_asked_about_each_ticket_once_and_not_at_all_with_none_due() {
+        let mut got = Vec::new();
+        ask_linear(
+            &[
+                ("DN-1".to_owned(), "/a".to_owned()),
+                ("DN-2".to_owned(), "/b".to_owned()),
+            ],
+            |id, _| Some(ticket(id)),
+            |arrival| got.push(arrival),
         );
-        let wait_for = |flag: &std::sync::atomic::AtomicBool| {
-            let start = Instant::now();
-            while !flag.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(5) {
-                std::thread::sleep(Duration::from_millis(5));
-            }
+        let [Arrival::Linear(found)] = got.as_slice() else {
+            panic!("one Linear arrival: {got:?}");
         };
-        let mut order = Vec::new();
-        ask_network(
-            &dirs,
-            &tickets,
-            |_, _| {
-                if gh_waits {
-                    wait_for(&linear_in);
-                }
-                Some(GhInfo {
-                    pr_number: Some(7),
-                    ..GhInfo::default()
-                })
-            },
-            |id, _| {
-                if !gh_waits {
-                    wait_for(&gh_in);
-                }
-                Some(ticket(id))
-            },
-            |arrival| match arrival {
-                Arrival::Gh(_) => {
-                    order.push("gh");
-                    gh_in.store(true, Ordering::SeqCst);
-                }
-                Arrival::Linear(_) => {
-                    order.push("linear");
-                    linear_in.store(true, Ordering::SeqCst);
-                }
-            },
-        );
-        order
-    }
-
-    #[test]
-    fn each_service_is_shown_as_it_answers_and_a_slow_one_holds_back_only_itself() {
-        assert_eq!(
-            arrivals(true),
-            ["linear", "gh"],
-            "GitHub stuck: Linear's answer is handed over first"
-        );
-        assert_eq!(
-            arrivals(false),
-            ["gh", "linear"],
-            "Linear stuck: GitHub's is"
-        );
-    }
-
-    #[test]
-    fn with_no_ticket_due_only_github_is_asked() {
-        let mut order = Vec::new();
-        ask_network(
-            &[("/a".into(), "main".into())],
+        let mut ids: Vec<&str> = found.iter().map(|(id, _)| id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["DN-1", "DN-2"]);
+        ask_linear(
             &[],
-            |_, _| None,
             |_, _| panic!("Linear asked with nothing due"),
-            |arrival| {
-                order.push(matches!(arrival, Arrival::Gh(_)));
-            },
+            |_| panic!("an arrival with nothing asked"),
         );
-        assert_eq!(order, [true]);
+    }
+
+    #[test]
+    fn a_branch_the_status_line_showed_never_replaces_a_sessions_own() {
+        let pair = |dir: &str, branch: &str| (dir.to_owned(), branch.to_owned());
+        assert_eq!(
+            with_seen(
+                vec![pair("/a", "feat")],
+                vec![pair("/a", "old"), pair("/wt", "other")]
+            ),
+            vec![pair("/a", "feat"), pair("/wt", "other")]
+        );
+    }
+
+    #[test]
+    fn a_github_round_runs_one_at_a_time() {
+        let round = GithubRound::default();
+        round.busy.store(true, Ordering::SeqCst);
+        // Under way: a second start does nothing (no thread, still busy).
+        round.start(
+            RoundAsks {
+                dirs: Vec::new(),
+                sessions: Vec::new(),
+                gone: Vec::new(),
+                now_ms: 0,
+                policy: gh::Policy::BASE,
+                pr_age_ms: 0,
+            },
+            None,
+        );
+        assert!(round.is_busy());
+        assert_eq!(round.stacks(), None, "no round ran");
     }
 
     #[test]

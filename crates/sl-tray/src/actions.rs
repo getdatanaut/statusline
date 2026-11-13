@@ -1,7 +1,7 @@
 //! What the session submenus do when clicked: fetch a review, read a job's
 //! logs, re-run a job, open a PR.
 //!
-//! Every action runs a subprocess (`gh`, or `zed`), which can take
+//! Every action asks GitHub or runs a subprocess (`zed`), which can take
 //! seconds, so each runs on its own thread and hands its result back through
 //! an [`Outbox`]. The main thread drains the outbox on its timer tick and does
 //! the AppKit part (clipboard, popup); nothing here touches AppKit.
@@ -30,8 +30,6 @@ pub enum Outcome {
 
 pub type Outbox = Arc<Mutex<Vec<Outcome>>>;
 
-/// How long a subprocess may run before it is killed.
-const TIMEOUT: Duration = Duration::from_secs(60);
 /// A popup shows at most this much of a log: its tail, where the failure is.
 const MAX_LOG_BYTES: usize = 200_000;
 
@@ -51,29 +49,8 @@ pub fn drain(outbox: &Outbox) -> Vec<Outcome> {
     )
 }
 
-/// `PATH` with the usual tool locations added: a tray started outside a shell
-/// has a bare `PATH`, and `gh`, `linear` and `zed` live in Homebrew's.
-fn search_path() -> String {
-    let home = dirs::home_dir().unwrap_or_default();
-    let mut dirs: Vec<String> = vec![
-        "/opt/homebrew/bin".into(),
-        "/usr/local/bin".into(),
-        home.join(".local/bin").display().to_string(),
-        home.join(".cargo/bin").display().to_string(),
-    ];
-    if let Ok(existing) = std::env::var("PATH") {
-        dirs.push(existing);
-    }
-    dirs.join(":")
-}
-
 /// Run `program args` in `cwd`, returning stdout, or the error text (stderr,
-/// else stdout) if it fails, cannot start, or outlives [`TIMEOUT`].
-fn run(program: &str, args: &[&str], cwd: &str) -> Result<String, String> {
-    run_for(program, args, cwd, TIMEOUT)
-}
-
-/// As [`run`], killing the process after `timeout`.
+/// else stdout) if it fails, cannot start, or outlives `timeout`.
 pub(crate) fn run_for(
     program: &str,
     args: &[&str],
@@ -84,7 +61,7 @@ pub(crate) fn run_for(
     command
         .args(args)
         .current_dir(cwd)
-        .env("PATH", search_path());
+        .env("PATH", sl_core::process::tool_path());
     match sl_core::process::run(command, timeout) {
         Ok(ran) if ran.success => Ok(ran.stdout),
         Ok(ran) if ran.stderr.trim().is_empty() => Err(ran.stdout),
@@ -256,10 +233,10 @@ pub fn open_review_in_zed(outbox: Outbox, cwd: String, pr: i64) {
 }
 
 /// The failed steps' logs of one job. A check from another app has no job id
-/// and no logs `gh` can fetch.
+/// and no logs to fetch.
 pub fn show_logs(outbox: Outbox, cwd: String, name: String, link: Option<String>) {
     if crate::effects::intercept(crate::effects::Effect::ShowLogs {
-        cwd: cwd.clone(),
+        cwd,
         job: name.clone(),
         link: link.clone(),
     }) {
@@ -267,17 +244,11 @@ pub fn show_logs(outbox: Outbox, cwd: String, name: String, link: Option<String>
     }
     spawn(move || {
         let title = format!("Logs · {name}");
-        let body = match link.as_deref().and_then(run_and_job_ids) {
+        let body = match link.as_deref().filter(|l| run_and_job_ids(l).is_some()) {
             None => "This check is not a GitHub Actions job, so there are no logs to fetch here."
                 .to_owned(),
-            Some((_, job)) => match run(
-                "gh",
-                &["run", "view", "--job", &job.to_string(), "--log-failed"],
-                &cwd,
-            ) {
-                Ok(log) if log.trim().is_empty() => {
-                    "The job has no failed-step log yet.".to_owned()
-                }
+            Some(link) => match sl_core::gh::jobs::failed_log(link) {
+                Ok(log) if log.trim().is_empty() => "The job has no log yet.".to_owned(),
                 Ok(log) => tail(&log, MAX_LOG_BYTES),
                 Err(error) => error,
             },
@@ -293,10 +264,10 @@ pub fn show_logs(outbox: Outbox, cwd: String, name: String, link: Option<String>
     });
 }
 
-/// Re-run one job (`gh run rerun --job`), and report whether GitHub took it.
+/// Re-run one job, and report whether GitHub took it.
 pub fn retry_job(outbox: Outbox, cwd: String, name: String, link: Option<String>) {
     if crate::effects::intercept(crate::effects::Effect::RetryJob {
-        cwd: cwd.clone(),
+        cwd,
         job: name.clone(),
         link: link.clone(),
     }) {
@@ -304,15 +275,11 @@ pub fn retry_job(outbox: Outbox, cwd: String, name: String, link: Option<String>
     }
     spawn(move || {
         let title = format!("Re-run · {name}");
-        let body = match link.as_deref().and_then(run_and_job_ids) {
+        let body = match link.as_deref().filter(|l| run_and_job_ids(l).is_some()) {
             None => "This check is not a GitHub Actions job, so it cannot be re-run from here."
                 .to_owned(),
-            Some((_, job)) => match run("gh", &["run", "rerun", "--job", &job.to_string()], &cwd) {
-                Ok(out) if out.trim().is_empty() => format!("Re-run requested for job {job}."),
-                Ok(out) => out,
-                // `gh` explains itself, e.g. that the run is still in progress.
-                Err(error) => error,
-            },
+            // GitHub explains a refusal, e.g. that the run is still in progress.
+            Some(link) => sl_core::gh::jobs::rerun(link).unwrap_or_else(|error| error),
         };
         push(
             &outbox,
@@ -333,11 +300,11 @@ pub fn open_in_zed(path: &str) {
         return;
     }
     let mut zed = Command::new("zed");
-    zed.arg(path).env("PATH", search_path());
+    zed.arg(path).env("PATH", sl_core::process::tool_path());
     if launch(zed).is_err() {
         let mut open = Command::new("open");
         open.args(["-a", "Zed", path])
-            .env("PATH", search_path());
+            .env("PATH", sl_core::process::tool_path());
         launch(open).ok();
     }
 }
@@ -388,6 +355,8 @@ fn tail(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SECOND: Duration = Duration::from_secs(1);
 
     #[test]
     fn short_logs_pass_through_and_long_ones_keep_the_tail_from_a_line_start() {
@@ -488,14 +457,14 @@ mod tests {
 
     #[test]
     fn run_reports_stdout_failures_and_missing_programs() {
-        assert_eq!(run("echo", &["hi"], "/tmp").unwrap().trim(), "hi");
+        assert_eq!(run_for("echo", &["hi"], "/tmp", SECOND).unwrap().trim(), "hi");
         assert!(
-            run("sh", &["-c", "echo boom >&2; exit 3"], "/tmp")
+            run_for("sh", &["-c", "echo boom >&2; exit 3"], "/tmp", SECOND)
                 .unwrap_err()
                 .contains("boom")
         );
         assert!(
-            run("definitely-not-a-program-xyz", &[], "/tmp")
+            run_for("definitely-not-a-program-xyz", &[], "/tmp", SECOND)
                 .unwrap_err()
                 .contains("cannot run")
         );

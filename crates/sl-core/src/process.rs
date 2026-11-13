@@ -4,6 +4,23 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// `PATH` with the usual tool locations in front: a program started outside a
+/// shell (the tray, as a login item) has a bare `PATH`, and `gh`, `linear`
+/// and `zed` live in Homebrew's.
+pub fn tool_path() -> String {
+    let home = dirs::home_dir().unwrap_or_default();
+    let mut dirs: Vec<String> = vec![
+        "/opt/homebrew/bin".into(),
+        "/usr/local/bin".into(),
+        home.join(".local/bin").display().to_string(),
+        home.join(".cargo/bin").display().to_string(),
+    ];
+    if let Ok(existing) = std::env::var("PATH") {
+        dirs.push(existing);
+    }
+    dirs.join(":")
+}
+
 /// What a finished program left.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ran {
@@ -31,13 +48,43 @@ pub enum RunError {
 /// [`RunError::Spawn`] if it cannot be started, [`RunError::TimedOut`] if it
 /// outlived `timeout` (or could no longer be waited for) and was killed. A
 /// program that ran and failed is an `Ok` whose `success` is false.
-pub fn run(mut command: Command, timeout: Duration) -> Result<Ran, RunError> {
+pub fn run(command: Command, timeout: Duration) -> Result<Ran, RunError> {
+    run_inner(command, None, timeout)
+}
+
+/// [`run`], with `input` written to the program's stdin, which is then closed.
+///
+/// # Errors
+///
+/// As [`run`].
+pub fn run_with_input(command: Command, input: &[u8], timeout: Duration) -> Result<Ran, RunError> {
+    run_inner(command, Some(input), timeout)
+}
+
+fn run_inner(
+    mut command: Command,
+    input: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<Ran, RunError> {
     let mut child = command
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(RunError::Spawn)?;
+    // Written from a thread, so a program that does not read it all cannot
+    // stall this one; dropping the pipe closes it.
+    let writer = input.zip(child.stdin.take()).map(|(input, mut pipe)| {
+        let input = input.to_vec();
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            pipe.write_all(&input).ok();
+        })
+    });
     let drain = |pipe: Option<Box<dyn Read + Send>>| {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
@@ -81,6 +128,9 @@ pub fn run(mut command: Command, timeout: Duration) -> Result<Ran, RunError> {
     };
     // The pipes close once the child is gone (unless it left a grandchild
     // holding them, which the time limit does not cover either).
+    if let Some(writer) = writer {
+        writer.join().ok();
+    }
     let stdout = stdout.join().unwrap_or_default();
     let stderr = stderr.join().unwrap_or_default();
     let status = status.ok_or(RunError::TimedOut)?;

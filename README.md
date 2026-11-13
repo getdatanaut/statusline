@@ -50,8 +50,13 @@ Segments (each drops out silently when its data is unavailable):
   to its job. When the PR targets something other than `main`/`master`, `→`
   after the PR names that branch and *its own* open PR (the parent in a
   stack).
-  Data from `gh`, cached under `~/.cache/statusline/gh/` and refreshed in the
-  background, so it appears one refresh late. Links are OSC 8: Cmd+click in
+  Read from `~/.cache/statusline/gh.sqlite`, which the tray fills from
+  GitHub's API with its own token (see [GitHub](#github)). Without the tray
+  (not installed, not running, or holding no token), the status line asks
+  GitHub itself with the token of the `gh` command line tool
+  (`gh auth token`), from a detached process, so a render never waits on the
+  network; the answer appears one render later. With neither the tray nor a
+  signed-in `gh`, there is no PR segment, and nothing else changes. Links are OSC 8: Cmd+click in
   terminals that support them. Claude Code only passes them on in terminals
   it recognizes; elsewhere (Zed's terminal, for one) set `FORCE_HYPERLINK=1`.
 
@@ -144,6 +149,7 @@ transcripts `ccusage` does and prices them from embedded pricing catalogs, so it
 needs no network and no API key.
 
 ```sh
+make signing-cert  # once per Mac: a self-signed code-signing identity in your login keychain
 make install     # build, bundle as ~/Applications/Statusline Tray.app, sign, and start it as a login item
 make restart     # restart the installed tray
 make logs        # follow its log (~/Library/Logs/statusline-tray.log)
@@ -155,6 +161,63 @@ Install it with `make install`: macOS only delivers notifications to a signed
 app bundle it knows about. `cargo install --path crates/sl-tray` also works and
 runs the same tray (`statusline-tray`, an accessory app with no Dock icon), but
 it sends no notifications.
+
+#### GitHub
+
+PRs, reviews, CI and stacks come from GitHub's API, with a token you give the
+tray in **Settings → Integrations**. The tray only ever uses that token: not
+the `gh` command line tool's, nor `GH_TOKEN`/`GITHUB_TOKEN`. Save checks the
+token with GitHub before storing it. It needs:
+
+- **Classic token:** `repo` (PRs, reviews, CI, stacks, logs and re-running
+  jobs, private repositories included) and `read:org` (teams asked to
+  review). **Create token…** in Settings opens GitHub's new-token page with
+  both ticked. If an organization uses SAML single sign-on, authorize the token
+  for it (Configure SSO on the token's page).
+- **Fine-grained token**, with the organization as its resource owner (one
+  owner per token; the organization may have to approve it): repository
+  permissions Pull requests, Contents, Commit statuses and Checks: read;
+  Actions: read and write (write only for re-running jobs); organization
+  permission Members: read.
+
+The token is kept in your login Keychain, readable by the tray alone: any
+other program that asks for it (a script, an agent, `security
+find-generic-password`) gets a password prompt. The Keychain knows the tray by
+its code signature, so sign it with the same identity every build:
+
+1. `make signing-cert` once. It creates a self-signed "Statusline Dev"
+   code-signing certificate in your login keychain (trusted by nothing; it
+   only has to stay the same), and `make install` signs with it from then on,
+   asking for your login password each time: no program may use the key
+   silently, so none can sign itself as the tray to get at the token. The
+   tray is also signed with the hardened runtime, so no other program can
+   load code into it.
+   Without it `make install` signs ad-hoc, warns, and each new build has to be
+   allowed the token again.
+2. `make install`, then paste the token in Settings → Integrations.
+
+To remove the certificate, delete "Statusline Dev" (certificate and key) in
+Keychain Access; to remove the token, use Remove in Settings.
+
+**Who asks GitHub.** The tray, while it runs and holds a token, notes so in
+`~/.cache/statusline/gh.sqlite` every minute; the status line then only reads
+what the tray stored. If the tray has not said so for three minutes (it is
+not running, or has no token), the status line falls back to asking by
+itself with `gh auth token` -- never with the tray's token, which only the
+tray can read. Both write the same store, so whichever asked, both show the
+same answer.
+
+**When GitHub is unreachable.** Nothing breaks: a request gives up after 15
+seconds, and one round of the tray's requests stops after a minute however
+many it makes. The tray asks on a thread of its own, one round at a time
+(none starts while another is under way), so the session list never waits on
+GitHub; the status line asks from a detached process. What was stored stays
+shown, and a repository that failed is not asked again for two minutes. A missing token, or a missing `gh`, only means no
+new PR data: the menu says "No GitHub token", and everything else (usage,
+sessions, Linear) carries on. When GitHub starts refusing the tray's token
+(it expired, or was revoked), the tray says so once in a notification, in
+Settings and in the menu, and the status line falls back to `gh` until a new
+token is saved.
 
 The open sessions sit under the usage limits: the running Claude Code sessions,
 read from the record Claude Code keeps for each in `~/.claude/sessions/`
@@ -189,8 +252,8 @@ them all across launches):
   is on (`Stack #746 · 6/10 merged`, and the PR the work is at). Its submenu
   lists the PRs top first, as GitHub does -- merged, open or draft, and which
   session is on each -- each opening its PR, and Open stack on GitHub. GitHub's
-  own stacks come from its `repos/{owner}/{repo}/stacks` endpoint (via `gh`,
-  on the PR & CI refresh interval); PRs chained by hand, each based on the one
+  own stacks come from its `repos/{owner}/{repo}/stacks` endpoint (on the
+  PR & CI refresh interval); PRs chained by hand, each based on the one
   below, are pieced together from their base PRs.
 - **Compact** is a popover of one-line cards, grouped by project (the git repo,
   so all of its worktrees together), with an All / Needs you / Working / Cold
@@ -199,7 +262,11 @@ them all across launches):
   buttons, and buttons for what the Regular submenu offers. The footer holds
   the Auto caffeinate toggle and the Settings gear.
 
-PR and CI data come from the same per-branch `gh` cache the status line uses.
+PR and CI data come from GitHub's API, kept in the same store the status line
+reads (`~/.cache/statusline/gh.sqlite`): a branch with a push in the last 15
+minutes (or checks still running) is asked about on the PR & CI interval, an
+open PR every 10 minutes, a merged one every 6 hours, and opening the menu
+asks again about anything older than 30 seconds.
 
 A branch named for a Linear ticket (`jakub/dn-479-…` is `DN-479`) shows the
 ticket and its state (`DN-479 · In Progress`) in the session's submenu and on its
@@ -210,7 +277,7 @@ Settings can switch them off.
 
 In Regular, hover a session for its submenu: the PR (draft or ready, base branch), each
 reviewer and their verdict, copy the unresolved review feedback (its reviews,
-unresolved threads and conversation as markdown, fetched with `gh`), open the
+unresolved threads and conversation as markdown), open the
 PR, copy the directory's full path, open the worktree in Zed (the directory is
 already the branch's worktree), open the review feedback in Zed (written to a
 file only you can read, under `statusline/` in your own temporary directory,
@@ -276,7 +343,8 @@ For working on the tray without anything real behind it, `SL_TRAY_FIXTURE=full`
 (or `stale`, `nolimits`, `empty`) runs it on made-up sessions and usage with no
 background threads. `--dump-views <fixture>` prints both layouts as text, and
 `--self-test` clicks every control in the menu, the popover and the windows and
-prints what each did, recording effects (opening a URL, copying, `gh` calls)
+prints what each did, recording effects (opening a URL, copying, GitHub actions; GitHub
+itself is never asked)
 instead of performing them. Both need `SL_TRAY_DEFAULTS_SUITE` set to a scratch
 defaults suite, so they never touch the tray's real settings;
 `crates/sl-tray/tests/self_test.rs` runs them in a sandbox.
