@@ -328,6 +328,9 @@ fn main() {
     let app = NSApplication::sharedApplication(mtm);
     // Accessory: menu bar only. No Dock icon, no menu bar app menu, no window.
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    // Never shown, but ⌘V and the rest reach the windows' text fields (the
+    // closed-sessions search, Settings) only through it.
+    sl_macos::system::install_edit_menu(mtm);
 
     // `--icon-preview <prefix>`: the menu bar icon's states, and the menu's
     // limits row, as images for looking at while working on them. Draws and

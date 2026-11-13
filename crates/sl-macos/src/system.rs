@@ -5,7 +5,7 @@ use objc2::MainThreadMarker;
 use objc2::rc::Retained;
 use objc2::{AnyThread, MainThreadOnly};
 use objc2_app_kit::{
-    NSButton, NSMenuItem, NSPasteboard, NSPasteboardTypeString, NSTabViewItem, NSTextStorage,
+    NSApplication, NSButton, NSMenu, NSMenuItem, NSPasteboard, NSPasteboardTypeString, NSTabViewItem, NSTextStorage,
     NSTextView, NSTrackingArea, NSTrackingAreaOptions, NSView,
 };
 use objc2_foundation::{NSRect, NSString, NSUserDefaults};
@@ -70,6 +70,39 @@ pub fn track_view(view: &NSView, options: NSTrackingAreaOptions) {
         )
     };
     view.addTrackingArea(&area);
+}
+
+/// Give the app a main menu holding only Edit (Undo, Cut, Copy, Paste,
+/// Select All), so ⌘Z/⌘X/⌘C/⌘V/⌘A work in its text fields. An accessory app
+/// never shows its main menu, but key equivalents still go through it, and
+/// without one a text field gets none of them.
+pub fn install_edit_menu(mtm: MainThreadMarker) {
+    let edit = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Edit"));
+    for (title, action, key) in [
+        ("Undo", objc2::sel!(undo:), "z"),
+        ("Redo", objc2::sel!(redo:), "Z"),
+        ("Cut", objc2::sel!(cut:), "x"),
+        ("Copy", objc2::sel!(copy:), "c"),
+        ("Paste", objc2::sel!(paste:), "v"),
+        ("Select All", objc2::sel!(selectAll:), "a"),
+    ] {
+        // SAFETY: each is a standard responder action, sent along the
+        // responder chain (no target), which ignores it where unhandled.
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(title),
+                Some(action),
+                &NSString::from_str(key),
+            )
+        };
+        edit.addItem(&item);
+    }
+    let edit_item = menu_item(mtm, "Edit");
+    edit_item.setSubmenu(Some(&edit));
+    let main = NSMenu::new(mtm);
+    main.addItem(&edit_item);
+    NSApplication::sharedApplication(mtm).setMainMenu(Some(&main));
 }
 
 /// A menu item titled `title`, with no action and no key equivalent.
