@@ -229,11 +229,9 @@ fn the_view_dump_shows_both_layouts_and_comes_out_the_same_twice() {
         "the footer, from the fixed clock"
     );
     // A PR's pills, worded for where they are: the submenu header's count,
-    // the compact card's count of what.
-    assert!(
-        text.contains("[‹Green:Ready for review›] … [‹Red:CI ✗ 1›]"),
-        "the header's pills"
-    );
+    // the compact card's count of what. A PR that is not a draft has no
+    // state pill: the CI follows the title.
+    assert!(text.contains("\" … [‹Red:CI ✗ 1›]"), "the header's pills");
     assert!(text.contains("text \"CI ✗ 1 failed\""), "a card's CI pill");
     let second = sandbox.run(&["--dump-views", "full"]);
     assert_eq!(

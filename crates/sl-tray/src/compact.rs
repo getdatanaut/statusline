@@ -9,7 +9,7 @@
 //! ┌ ◔ DN-479 / M4                         10m left ┐
 //! ┌ ❄ DN-531 / M4 #3  #753                    cold ┐
 //! │   jakub/dn-531-m24-fire-and-deliver            │
-//! │   #753 [Ready] [CI ✓] [Risk 4/5] [Quality 4/5] │
+//! │   #753 [CI ✓] [Risk 4/5] [Quality 4/5]         │
 //! │   → jakub/dn-530-m22-…-dependency-edges        │
 //! │   [Zed] [PR] [Copy review] [Copy path]           │
 //! └────────────────────────────────────────────────┘

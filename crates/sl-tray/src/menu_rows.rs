@@ -908,7 +908,7 @@ impl ActionParts {
 /// What a submenu's header card shows:
 ///
 /// ```text
-/// ⑂ #753  [Ready for review]                 [CI ✓]
+/// ⑂ #753  [Draft] [Approved]                  [CI ✓]
 /// → jakub/dn-530-m22-…-dependency-edges
 /// 5a540c4 · stacked on #752
 /// ```
