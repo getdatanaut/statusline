@@ -153,7 +153,8 @@ const EXPECTED: &[&str] = &[
     "compact / card Stack #746  2/5 merged / Open stack on GitHub => open https://github.com/o/r/pull/753; popover closed",
     "compact / card DN-512 / M2 drafts => view changed",
     "compact / card DN-512 / M2 drafts / Copy resume command => copy \"claude --resume c1\"; popover closed",
-    "compact / card codex refactor / Zed => zed /x/x9; popover closed",
+    // No Zed for codex refactor: its directory, /x/x9, does not exist.
+    "compact / card codex refactor / Copy resume command => copy \"codex resume x9\"; popover closed",
     "compact / Quit => quit",
     // Settings: every tab, every kind of control.
     "settings / [Compact] => set layout=compact",
