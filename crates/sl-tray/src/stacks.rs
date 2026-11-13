@@ -1,7 +1,7 @@
 //! Stacks of pull requests the sessions' branches belong to.
 //!
 //! Two kinds. GitHub's own stacks (what `gh stack submit` makes) are read from
-//! the `repos/{owner}/{repo}/stacks` endpoint, one call per repository: each
+//! the REST API's `repos/{owner}/{repo}/stacks`, one call per repository: each
 //! lists its PRs bottom to top with their state. A hand-made stack -- each PR
 //! based on the branch of the one below -- is pieced together from the parent
 //! PR each session's PR records (`GhInfo::base_pr`).
@@ -20,15 +20,18 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use serde::Deserialize;
+
+use sl_core::gh::Store;
+use sl_core::gh::api::Budget;
 
 use crate::sessions::OpenSession;
 use crate::sticky::Remembered;
 
-/// A lookup is abandoned after this long; it runs on the sessions thread.
-const TIMEOUT: Duration = Duration::from_secs(15);
+/// A lookup is abandoned after this many seconds, or sooner when the round's
+/// [`Budget`] runs out first.
+const TIMEOUT_SECS: u64 = 15;
 /// A repository whose stacks could not be read is asked again this many
 /// times less often than one whose could.
 const FAILED_SLOWDOWN: i64 = 5;
@@ -211,13 +214,30 @@ impl StackCache {
     }
 
     /// The open stacks of `repo`, asked from `cwd`, a directory in it.
+    /// `store` keeps the last good answer across restarts: a tray started
+    /// before the network is up shows the stacks it knew until GitHub can be
+    /// asked, not hand-made chains pieced together without them.
     fn open_stacks(
         &mut self,
         repo: PathBuf,
         cwd: &str,
+        store: Option<&Store>,
         now_ms: i64,
         max_age_ms: i64,
+        budget: &Budget,
     ) -> Vec<ApiStack> {
+        let name = sl_core::git::github_repo(cwd);
+        if !self.repos.contains_key(&repo)
+            && let Some((json, at)) = name
+                .as_deref()
+                .zip(store)
+                .and_then(|(name, store)| store.stacks(name))
+            && let Some(stacks) = parse_api(&json)
+        {
+            // Asked about again as it would have been had the tray kept
+            // running: once older than `max_age_ms`.
+            self.repos.insert(repo.clone(), (at, Some(stacks)));
+        }
         if let Some((at, stacks)) = self.repos.get(&repo) {
             let age = if stacks.is_some() {
                 max_age_ms
@@ -233,11 +253,20 @@ impl StackCache {
                     .collect();
             }
         }
-        // `gh` fills in `{owner}/{repo}` from the directory's own remote.
-        let fetched =
-            crate::actions::run_for("gh", &["api", "repos/{owner}/{repo}/stacks"], cwd, TIMEOUT)
-                .ok()
-                .and_then(|json| parse_api(&json));
+        let fetched = name.as_deref().and_then(|name| {
+            let json = budget
+                .secs(TIMEOUT_SECS)
+                .and_then(|secs| {
+                    sl_core::gh::api::rest("GET", &format!("repos/{name}/stacks"), secs)
+                })
+                .and_then(sl_core::gh::api::Response::ok)
+                .ok()?;
+            let stacks = parse_api(&json)?;
+            if let Some(store) = store {
+                store.set_stacks(name, &json, now_ms);
+            }
+            Some(stacks)
+        });
         // A failed read keeps what was known, as a brief outage is not every
         // stack closing.
         let stacks = fetched.or_else(|| self.repos.get(&repo).and_then(|(_, s)| s.clone()));
@@ -260,6 +289,7 @@ impl StackCache {
         mut numbers: Vec<i64>,
         now_ms: i64,
         max_age_ms: i64,
+        budget: &Budget,
     ) -> HashMap<i64, EntryState> {
         numbers.sort_unstable();
         numbers.dedup();
@@ -277,7 +307,7 @@ impl StackCache {
         let fetched = if numbers.is_empty() {
             Some(HashMap::new())
         } else {
-            fetch_states(cwd, &numbers)
+            fetch_states(cwd, &numbers, budget)
         };
         // A PR GitHub is still working out leaves its last known state in
         // place: the answer has no news about it, only a gap.
@@ -308,8 +338,10 @@ pub fn build(
     live: &[OpenSession],
     closed: &[Remembered],
     cache: &mut StackCache,
+    store: Option<&Store>,
     now_ms: i64,
     max_age_ms: i64,
+    budget: &Budget,
 ) -> Vec<StackView> {
     let all: HashSet<&str> = live
         .iter()
@@ -328,10 +360,17 @@ pub fn build(
     }
     let mut api: Vec<(PathBuf, ApiStack)> = Vec::new();
     for (repo, cwd) in &dirs {
-        let stacks = cache.open_stacks(repo.clone(), cwd, now_ms, max_age_ms);
+        let stacks = cache.open_stacks(repo.clone(), cwd, store, now_ms, max_age_ms, budget);
         api.extend(stacks.into_iter().map(|stack| (repo.clone(), stack)));
     }
     let mut views = assemble(live, closed, &repo_of, &api);
+    if let Some(store) = store {
+        for view in &mut views {
+            closed_states(view, closed, |cwd, branch| {
+                sl_core::gh::load(store, cwd, branch)
+            });
+        }
+    }
 
     // Each stack's PRs not yet merged, asked about per repository.
     let mut asks: HashMap<PathBuf, Vec<i64>> = HashMap::new();
@@ -352,7 +391,7 @@ pub fn build(
         };
         known.insert(
             repo.clone(),
-            cache.pr_states(repo, cwd, numbers, now_ms, max_age_ms),
+            cache.pr_states(repo, cwd, numbers, now_ms, max_age_ms, budget),
         );
     }
     for view in &mut views {
@@ -362,6 +401,48 @@ pub fn build(
     }
     cache.retain(&dirs.keys().cloned().collect(), &all);
     views
+}
+
+/// A closed session's PR, whose state its session does not remember: as
+/// `load` (the PR store) last had it, so a chain shows it open or merged
+/// while GitHub cannot be asked, rather than unknown. GitHub's answer, when
+/// it comes, goes over it.
+fn closed_states(
+    view: &mut StackView,
+    closed: &[Remembered],
+    load: impl Fn(&str, &str) -> Option<sl_core::gh::GhInfo>,
+) {
+    for entry in &mut view.entries {
+        if entry.state != EntryState::Unknown {
+            continue;
+        }
+        let EntrySession::Closed(name) = &entry.session else {
+            continue;
+        };
+        let Some(session) = closed.iter().find(|c| {
+            &c.name == name
+                && c.pr_number == Some(entry.number)
+                && c.branch.is_some()
+                && c.branch == entry.branch
+        }) else {
+            continue;
+        };
+        let Some(info) = session
+            .branch
+            .as_deref()
+            .and_then(|branch| load(&session.cwd, branch))
+            .filter(|info| info.pr_number == Some(entry.number))
+        else {
+            continue;
+        };
+        entry.state = match (info.state.as_deref(), info.is_draft) {
+            (Some("MERGED"), _) => EntryState::Merged,
+            (Some("CLOSED"), _) => EntryState::Closed,
+            (Some("OPEN"), Some(true)) => EntryState::Draft,
+            (Some("OPEN"), _) => EntryState::Open,
+            _ => continue,
+        };
+    }
 }
 
 /// Each PR's state as GitHub gave it, over what the stack or chain knew.
@@ -375,7 +456,7 @@ fn apply_states(view: &mut StackView, states: &HashMap<i64, EntryState>) {
 }
 
 /// The states of `numbers`, PRs in the repository of `cwd`, in one call.
-fn fetch_states(cwd: &str, numbers: &[i64]) -> Option<HashMap<i64, EntryState>> {
+fn fetch_states(cwd: &str, numbers: &[i64], budget: &Budget) -> Option<HashMap<i64, EntryState>> {
     let fields: String = numbers.iter().fold(String::new(), |mut fields, n| {
         write!(fields, "p{n}: pullRequest(number: {n}) {{ number state isDraft merged isInMergeQueue mergeable mergeStateStatus }} ").ok();
         fields
@@ -383,23 +464,15 @@ fn fetch_states(cwd: &str, numbers: &[i64]) -> Option<HashMap<i64, EntryState>> 
     let query = format!(
         "query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ {fields}}} }}"
     );
-    // `gh` fills in `{owner}` and `{repo}` in field values too.
-    let json = crate::actions::run_for(
-        "gh",
-        &[
-            "api",
-            "graphql",
-            "-F",
-            "owner={owner}",
-            "-F",
-            "name={repo}",
-            "-f",
-            &format!("query={query}"),
-        ],
-        cwd,
-        TIMEOUT,
-    )
-    .ok()?;
+    let (owner, name) = sl_core::git::github_repo(cwd)?
+        .split_once('/')
+        .map(|(o, n)| (o.to_owned(), n.to_owned()))?;
+    let body = serde_json::json!({
+        "query": query,
+        "variables": { "owner": owner, "name": name },
+    })
+    .to_string();
+    let json = sl_core::gh::api::graphql(&body, budget.secs(TIMEOUT_SECS).ok()?).ok()?;
     parse_states(&json)
 }
 
@@ -914,6 +987,43 @@ mod tests {
         assert_eq!(
             stacks[0].repo_url.as_deref(),
             Some("https://github.com/o/r")
+        );
+    }
+
+    #[test]
+    fn a_closed_sessions_pr_takes_its_state_from_the_pr_store() {
+        let gone = [
+            closed_in("/a", "draft", 10, None),
+            closed_in("/b", "merged", 20, Some(10)),
+            closed_in("/c", "unasked", 30, Some(20)),
+        ];
+        let mut view = in_one_repo(&[], &gone, &[]).remove(0);
+        let info = |pr: i64, state: &str, draft: bool| GhInfo {
+            pr_number: Some(pr),
+            state: Some(state.into()),
+            is_draft: Some(draft),
+            ..GhInfo::default()
+        };
+        closed_states(&mut view, &gone, |cwd, branch| match (cwd, branch) {
+            ("/a", "draft") => Some(info(10, "OPEN", true)),
+            ("/b", "merged") => Some(info(20, "MERGED", false)),
+            // Another PR on the branch than the session's: says nothing.
+            ("/c", "unasked") => Some(info(31, "OPEN", false)),
+            _ => None,
+        });
+        let states: Vec<(i64, EntryState)> =
+            view.entries.iter().map(|e| (e.number, e.state)).collect();
+        assert_eq!(
+            states,
+            [
+                (10, EntryState::Draft),
+                (20, EntryState::Merged),
+                (30, EntryState::Unknown)
+            ]
+        );
+        assert!(
+            view.entries.iter().all(|e| !e.checked),
+            "the store's state is not GitHub's settled answer"
         );
     }
 

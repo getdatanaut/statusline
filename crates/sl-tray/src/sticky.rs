@@ -316,9 +316,9 @@ pub fn transcript_facts(tail: &str) -> TranscriptFacts {
 /// The sessions worth remembering from before the tray first ran: every
 /// transcript modified within [`KEEP_MS`] that was an interactive session
 /// with a prompt in it, not running now, in a directory still there. Read from
-/// each transcript's tail; its PR only from the `gh` cache, never the network.
+/// each transcript's tail; its PR only from the `gh` store, never the network.
 pub fn backfill(live_ids: &[&str], now_ms: i64) -> Vec<Remembered> {
-    let gh_cache = sl_core::gh::default_cache_dir();
+    let gh_store = sl_core::gh::Store::open_default();
     let mut found = Vec::new();
     for base in sl_usage::paths::claude_paths().unwrap_or_default() {
         let Ok(projects) = std::fs::read_dir(base.join("projects")) else {
@@ -357,7 +357,11 @@ pub fn backfill(live_ids: &[&str], now_ms: i64) -> Vec<Remembered> {
                     &id,
                     &transcript_facts(&tail),
                     last_seen_ms,
-                    |cwd, branch| sl_core::gh::load_cached(&gh_cache, cwd, branch),
+                    |cwd, branch| {
+                        gh_store
+                            .as_ref()
+                            .and_then(|store| sl_core::gh::load(store, cwd, branch))
+                    },
                 ) {
                     found.push(entry);
                 }

@@ -42,6 +42,8 @@ mod effects;
 mod feedback;
 mod fixture;
 mod inspect;
+mod integrations;
+mod keychain;
 mod latest;
 mod limits;
 mod linear;
@@ -355,6 +357,10 @@ fn main() {
         self_test::dump_views(mtm, &spec);
     }
 
+    // GitHub is asked with the token in the tray's own Keychain item; the
+    // self-test and the previews above never get this far.
+    sl_core::gh::api::use_token_source(keychain::read);
+
     let auto_awake = awake::AutoCaffeinate::new(AtomicBool::new(awake::load()));
     // `SL_TRAY_FIXTURE`: made-up state and no background threads, for
     // looking at the tray without anything real behind it.
@@ -387,6 +393,7 @@ fn main() {
                 Arc::clone(&auto_awake),
                 Arc::clone(&sticky),
             );
+            integrations::spawn_heartbeat();
             (shared, board, sticky)
         }
     };

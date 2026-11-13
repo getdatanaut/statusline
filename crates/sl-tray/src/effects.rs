@@ -1,5 +1,5 @@
 //! Every effect the tray has on the world outside its own windows, in one
-//! place: opening a URL or a worktree, the clipboard, the `gh` actions, the
+//! place: opening a URL or a worktree, the clipboard, the GitHub actions, the
 //! confirm dialog, popups, notifications and `caffeinate`.
 //!
 //! In normal running nothing here changes anything: each effect's own
@@ -43,6 +43,9 @@ pub(crate) enum Effect {
         body: String,
     },
     Caffeinate(bool),
+    /// Storing a GitHub token (never shown), or removing it.
+    SaveToken,
+    RemoveToken,
     Quit,
 }
 
@@ -68,6 +71,8 @@ impl std::fmt::Display for Effect {
             Effect::Popup(title) => write!(f, "popup {title:?}"),
             Effect::Notify { title, body } => write!(f, "notify {title:?}: {body:?}"),
             Effect::Caffeinate(on) => write!(f, "caffeinate {}", if *on { "on" } else { "off" }),
+            Effect::SaveToken => write!(f, "save GitHub token"),
+            Effect::RemoveToken => write!(f, "remove GitHub token"),
             Effect::Quit => write!(f, "quit"),
         }
     }
@@ -83,7 +88,10 @@ static RECORDER: OnceLock<Recorder> = OnceLock::new();
 
 /// From now on, write every effect down instead of performing it, and answer
 /// every confirm dialog with `confirm`. For the self-test; there is no way back.
+/// GitHub goes offline too: the Keychain and curl are at fixed paths the
+/// self-test's stubbed `PATH` cannot catch.
 pub(crate) fn record(confirm: bool) {
+    sl_core::gh::api::go_offline();
     let recorder = RECORDER.get_or_init(|| Recorder {
         log: Mutex::new(Vec::new()),
         confirm: AtomicBool::new(confirm),

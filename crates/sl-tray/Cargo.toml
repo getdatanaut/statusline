@@ -25,6 +25,8 @@ sl-usage = { path = "../sl-usage" }
 # it back; and the remembered closed sessions are stored as JSON.
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+# The GitHub token, in a Keychain item only this app may read.
+security-framework = { version = "3.5.1", default-features = false }
 pulldown-cmark = { version = "0.13", default-features = false }
 
 # Both framework crates default to enabling ~700 features (essentially all of
@@ -106,6 +108,8 @@ features = [
     "NSScrollView",
     # The Closed Sessions window's filter.
     "NSSearchField",
+    # Settings → Integrations: the GitHub token field.
+    "NSSecureTextField",
     # The tray's fixed width, from the screen's.
     "NSScreen",
     "NSText",

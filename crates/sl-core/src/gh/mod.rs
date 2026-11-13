@@ -1,31 +1,36 @@
-//! GitHub PR context (target branch, CI status) for the status line.
+//! GitHub PR context (state, reviews, CI, the PR below it) for the status
+//! line and the tray.
 //!
-//! `gh` takes around a second per call, far too slow to run inside a render.
-//! So a render only ever reads a per-branch cache file; when that file is
-//! stale it spawns a detached `statusline --gh-refresh` that runs `gh` and
-//! rewrites the cache for the next render. The first render on a branch
-//! therefore shows nothing, and data lags by at most one refresh.
+//! What GitHub said is kept in one SQLite database ([`store`]), keyed by
+//! repository and branch, and shared by every worktree and both programs:
+//! the tray asks GitHub and stores the answers, and the status line reads
+//! them, asking by itself only while no tray is (see [`sync`]). A
+//! branch's PR, once found, is never looked for again: GitHub is asked only
+//! when an answer is due ([`sync`]): an open PR every so often or after a push,
+//! a branch with no PR yet less often, a merged one rarely. All due branches
+//! of a repository are asked about in one GraphQL request ([`api`]). A request
+//! that fails changes nothing that is stored.
+
+pub mod api;
+pub mod jobs;
+pub mod store;
+pub mod sync;
+
+pub use store::Store;
+pub use sync::{Policy, load, load_and_refresh, run_refresh, sync, tray_is_asking};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime};
 
-/// Bumped when `GhInfo` gains data a consumer needs. An entry written by an
-/// older build (whose status line shares this cache) lacks it, so it is
-/// treated as stale whatever its age. 2: reviews, review requests, PR url.
-/// 3: reviews fold the full history (a later comment no longer hides an
-/// approval).
-const SCHEMA: u32 = 4;
-/// A cache entry older than this triggers a background refresh.
-const STALE_AFTER_MS: i64 = 30_000;
-/// Minimum gap between refresh spawns for one branch, so a slow `gh` is not
-/// stacked up by every render in between.
-const LOCK_FOR: Duration = Duration::from_secs(20);
-/// Hard stop for a refresh process, in case `gh` hangs on the network.
-const REFRESH_DEADLINE: Duration = Duration::from_secs(30);
+/// Bumped when `GhInfo` gains data a consumer needs; kept in each stored
+/// answer, and an answer under another schema is due again. 2: reviews, review
+/// requests, PR url. 3: reviews fold the full history. 4: the PR's state.
+/// 5: asked over GraphQL, stored in SQLite. 6: checks of the same name in
+/// different workflows kept apart, and checks past the first 100 counted.
+pub const SCHEMA: u32 = 6;
+/// An answer this long past when it was due again is shown as old: nothing
+/// is asking GitHub about it (no token, GitHub failing, no one running).
+pub const OLD_AFTER_MS: i64 = 10 * 60_000;
 /// Failed jobs listed individually; the rest collapse into `+N more`.
 pub const MAX_FAILED_ROWS: usize = 3;
 
@@ -188,15 +193,9 @@ pub struct GhInfo {
     /// `OPEN`, `MERGED` or `CLOSED`; absent in entries written before it was kept.
     #[serde(default)]
     pub state: Option<String>,
-    /// Until when the one who fetched this asks no one to fetch it again: the
-    /// tray's polling interval, which a status line render then honours
-    /// instead of its own 30 s. 0 in entries that do not carry one.
+    /// When this answer is due to be asked about again.
     #[serde(default)]
     pub fresh_until_ms: i64,
-    /// Set by a reader, never stored: this "no PR" answer is old enough that
-    /// the PR may exist by now, and has not been asked about again yet.
-    #[serde(skip)]
-    pub unconfirmed: bool,
 }
 
 impl GhInfo {
@@ -205,26 +204,15 @@ impl GhInfo {
         self.pr_number.is_some() && matches!(self.state.as_deref(), Some("MERGED" | "CLOSED"))
     }
 
-    /// Whether a render should have this branch asked about again: when the
-    /// entry predates the current schema, or has outlived the longer of the
-    /// status line's own interval and the one its fetcher vouched for. A
-    /// merged or closed PR is trusted for the recheck interval instead.
-    pub fn is_stale(&self, now_ms: i64) -> bool {
-        if self.schema != SCHEMA {
-            return true;
-        }
-        let fresh_until = if self.is_final() {
-            self.fetched_ms + FINAL_RECHECK_MS
-        } else {
-            (self.fetched_ms + STALE_AFTER_MS).max(self.fresh_until_ms)
-        };
-        now_ms >= fresh_until
+    /// How old this answer is, once it is [`OLD_AFTER_MS`] past when it was
+    /// due again; `None` while it is as fresh as it is meant to be. Each kind
+    /// of answer ages on its own clock: a merged PR is due again only after
+    /// hours, an open one after minutes.
+    pub fn old_for_ms(&self, now_ms: i64) -> Option<i64> {
+        (self.fresh_until_ms > 0 && now_ms - self.fresh_until_ms >= OLD_AFTER_MS)
+            .then(|| now_ms - self.fetched_ms)
     }
 }
-
-/// How long a merged or closed PR is trusted before the branch is asked about
-/// once more (a branch name can be reused for a new PR).
-const FINAL_RECHECK_MS: i64 = 60 * 60 * 1000;
 
 fn is_default_branch(branch: &str) -> bool {
     matches!(branch, "main" | "master")
@@ -236,245 +224,7 @@ pub fn worth_fetching(branch: &str) -> bool {
     !is_default_branch(branch) && !branch.starts_with('@')
 }
 
-/// Stable per-(directory, branch) file stem. FNV-1a, not `DefaultHasher`,
-/// whose output the standard library does not promise to keep.
-fn cache_key(dir: &str, branch: &str) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in dir.bytes().chain([0]).chain(branch.bytes()) {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    }
-    format!("{hash:016x}")
-}
-
-pub fn default_cache_dir() -> PathBuf {
-    crate::paths::cache_dir().join("gh")
-}
-
-fn cache_path(cache_dir: &Path, key: &str) -> PathBuf {
-    cache_dir.join(format!("{key}.json"))
-}
-
-fn lock_path(cache_dir: &Path, key: &str) -> PathBuf {
-    cache_dir.join(format!("{key}.lock"))
-}
-
-/// Render-side entry: return whatever is cached for this branch and, if it is
-/// missing or stale, kick off a background refresh. Never blocks on `gh`.
-pub fn load_and_refresh(cache_dir: &Path, dir: &str, branch: &str, now_ms: i64) -> Option<GhInfo> {
-    if !worth_fetching(branch) {
-        return None;
-    }
-    let key = cache_key(dir, branch);
-    let cached: Option<GhInfo> = crate::paths::read_json(&cache_path(cache_dir, &key));
-    if cached.as_ref().is_none_or(|c| c.is_stale(now_ms)) {
-        spawn_refresh(cache_dir, &key, dir, branch);
-    }
-    cached
-}
-
-/// Claim the right to run `gh` for this branch: false while someone else's
-/// claim is younger than [`LOCK_FOR`]. One claim per branch, whoever asks (a
-/// render's detached refresh or the tray), so the two never fetch at once.
-fn try_lock(cache_dir: &Path, key: &str) -> bool {
-    let lock = lock_path(cache_dir, key);
-    let recent = fs::metadata(&lock)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| SystemTime::now().duration_since(t).ok())
-        .is_some_and(|age| age < LOCK_FOR);
-    if recent {
-        return false;
-    }
-    fs::create_dir_all(cache_dir).ok();
-    fs::write(&lock, b"").is_ok()
-}
-
-/// Give the claim back once the answer is stored: a fresh entry needs no lock.
-fn unlock(cache_dir: &Path, key: &str) {
-    fs::remove_file(lock_path(cache_dir, key)).ok();
-}
-
-fn spawn_refresh(cache_dir: &Path, key: &str, dir: &str, branch: &str) {
-    if !try_lock(cache_dir, key) {
-        return;
-    }
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
-    // Best effort: a refresh that cannot start leaves the cache as it was.
-    Command::new(exe)
-        .arg("--gh-refresh")
-        .arg(dir)
-        .arg(branch)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok();
-}
-
-/// `statusline --gh-refresh <dir> <branch>`: run `gh`, rewrite the cache.
-pub fn run_refresh(cache_dir: &Path, dir: &str, branch: &str, now_ms: i64) {
-    std::thread::spawn(|| {
-        std::thread::sleep(REFRESH_DEADLINE);
-        #[expect(
-            clippy::exit,
-            reason = "a watchdog: a `gh` that hangs must not keep this detached process alive"
-        )]
-        std::process::exit(1);
-    });
-    store(cache_dir, dir, branch, &fetch(dir, now_ms));
-    unlock(cache_dir, &cache_key(dir, branch));
-}
-
-/// Whatever is cached for `branch` in `dir`, however old, without asking `gh`:
-/// for a caller that must not touch the network.
-pub fn load_cached(cache_dir: &Path, dir: &str, branch: &str) -> Option<GhInfo> {
-    if !worth_fetching(branch) {
-        return None;
-    }
-    let cached: GhInfo = crate::paths::read_json(&cache_path(cache_dir, &cache_key(dir, branch)))?;
-    (cached.schema == SCHEMA).then_some(cached)
-}
-
-/// Cached info for `branch` if it is younger than `max_age_ms(cached)`, else a
-/// synchronous `gh` round trip that rewrites the cache. For callers already on
-/// a background thread (the tray); a render must use [`load_and_refresh`].
-pub fn load_or_fetch(
-    cache_dir: &Path,
-    dir: &str,
-    branch: &str,
-    now_ms: i64,
-    max_age_ms: impl Fn(&GhInfo) -> i64,
-) -> Option<GhInfo> {
-    load_or_fetch_with(cache_dir, dir, branch, now_ms, max_age_ms, || {
-        fetch(dir, now_ms)
-    })
-}
-
-/// [`load_or_fetch`], asking `fetch_now` instead of `gh`. While another
-/// process holds the branch's claim the old entry is returned as it is, for
-/// that process to replace. A fresh answer carries `max_age_ms` as the time
-/// the status line may rely on it, so a render does not ask again meanwhile.
-fn load_or_fetch_with(
-    cache_dir: &Path,
-    dir: &str,
-    branch: &str,
-    now_ms: i64,
-    max_age_ms: impl Fn(&GhInfo) -> i64,
-    fetch_now: impl FnOnce() -> GhInfo,
-) -> Option<GhInfo> {
-    if !worth_fetching(branch) {
-        return None;
-    }
-    let key = cache_key(dir, branch);
-    let cached: Option<GhInfo> = crate::paths::read_json(&cache_path(cache_dir, &key));
-    let cached = cached.filter(|c| c.schema == SCHEMA);
-    if let Some(cached) = &cached
-        && now_ms - cached.fetched_ms
-            < if cached.is_final() {
-                FINAL_RECHECK_MS
-            } else {
-                max_age_ms(cached)
-            }
-    {
-        return Some(cached.clone());
-    }
-    if !try_lock(cache_dir, &key) {
-        return cached;
-    }
-    let mut info = fetch_now();
-    info.fresh_until_ms = now_ms + max_age_ms(&info);
-    store(cache_dir, dir, branch, &info);
-    unlock(cache_dir, &key);
-    Some(info)
-}
-
-/// Run `gh` in `dir` for the current branch's PR, its base and its checks.
-pub fn fetch(dir: &str, now_ms: i64) -> GhInfo {
-    fetch_with(Path::new("gh"), dir, now_ms)
-}
-
-/// [`fetch`], running `program` as `gh`.
-fn fetch_with(program: &Path, dir: &str, now_ms: i64) -> GhInfo {
-    let mut info = GhInfo {
-        fetched_ms: now_ms,
-        schema: SCHEMA,
-        ..GhInfo::default()
-    };
-    std::thread::scope(|scope| {
-        // Asked alongside `pr view`, not after it: two round trips at once.
-        // With no PR its answer is thrown away. `gh pr checks` exits non-zero
-        // for failing or pending checks but still prints the JSON, so only
-        // the output matters.
-        let checks = scope.spawn(|| {
-            gh(
-                program,
-                dir,
-                &["pr", "checks", "--json", "name,bucket,link"],
-            )
-        });
-        let view = gh(
-            program,
-            dir,
-            &[
-                "pr",
-                "view",
-                "--json",
-                "number,state,baseRefName,baseRefOid,isDraft,url,reviewDecision,reviews,author,reviewRequests,comments",
-            ],
-        );
-        let Some(pr) = view.as_deref().and_then(parse_pr_view) else {
-            return;
-        };
-        info.pr_number = Some(pr.number);
-        info.is_draft = pr.is_draft;
-        info.state = pr.state;
-        info.base_sha = pr.base_sha;
-        info.url = pr.url;
-        info.review_decision = pr.review_decision;
-        info.reviews = pr.reviews;
-        info.latest_reviews = pr.latest_reviews;
-        info.requested = pr.requested;
-        info.assessment = pr.assessment;
-        if is_non_default_base(&pr.base) && !pr.base.starts_with('-') {
-            info.base_pr = gh(program, dir, &["pr", "view", &pr.base, "--json", "number"])
-                .and_then(|out| serde_json::from_str::<Value>(&out).ok())
-                .and_then(|v| v.get("number")?.as_i64());
-        }
-        info.base = Some(pr.base);
-        info.ci = checks
-            .join()
-            .ok()
-            .flatten()
-            .as_deref()
-            .and_then(summarize_checks);
-    });
-    info
-}
-
-fn store(cache_dir: &Path, dir: &str, branch: &str, info: &GhInfo) {
-    crate::paths::write_json_atomic(&cache_path(cache_dir, &cache_key(dir, branch)), info);
-}
-
-fn gh(program: &Path, dir: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(program)
-        .args(args)
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    let text = String::from_utf8(out.stdout).ok()?;
-    let text = text.trim();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text.to_string())
-    }
-}
-
+/// One PR as GitHub describes it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PrView {
     pub number: i64,
@@ -488,13 +238,36 @@ pub struct PrView {
     pub latest_reviews: Vec<LatestReview>,
     pub requested: Vec<String>,
     pub assessment: Option<Assessment>,
+    /// From the head commit's check rollup; `None` with no checks, or when
+    /// the answer did not include them.
+    pub ci: Option<Ci>,
+    /// Opened from a fork: not the PR of this repository's branch.
+    pub cross_repository: bool,
+    /// The owner of the repository the PR's branch is in.
+    pub head_owner: Option<String>,
 }
 
 /// Length of the commit hashes shown.
 const SHA_LEN: usize = 10;
 
+/// [`pr_view`] of a JSON text.
 pub fn parse_pr_view(json: &str) -> Option<PrView> {
-    let v: Value = serde_json::from_str(json).ok()?;
+    pr_view(&serde_json::from_str(json).ok()?)
+}
+
+/// The elements of `v[key]`: a GraphQL connection's `nodes`, or a plain list.
+fn list<'a>(v: &'a Value, key: &str) -> &'a [Value] {
+    let field = v.get(key);
+    field
+        .and_then(|f| f.get("nodes"))
+        .or(field)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+}
+
+/// A GraphQL `PullRequest` node (or `gh pr view --json`'s like of it).
+pub fn pr_view(v: &Value) -> Option<PrView> {
     Some(PrView {
         number: v.get("number")?.as_i64()?,
         state: v.get("state").and_then(Value::as_str).map(String::from),
@@ -511,40 +284,136 @@ pub fn parse_pr_view(json: &str) -> Option<PrView> {
             .filter(|d| !d.is_empty())
             .map(String::from),
         reviews: per_reviewer(
-            v.get("reviews")
-                .and_then(Value::as_array)
-                .map(Vec::as_slice)
-                .unwrap_or_default(),
+            list(v, "reviews"),
             v.pointer("/author/login").and_then(Value::as_str),
         ),
         latest_reviews: latest_per_reviewer(
-            v.get("reviews")
-                .and_then(Value::as_array)
-                .map(Vec::as_slice)
-                .unwrap_or_default(),
+            list(v, "reviews"),
             v.pointer("/author/login").and_then(Value::as_str),
         ),
-        requested: v
-            .get("reviewRequests")
-            .and_then(Value::as_array)
-            .map(|requests| {
-                requests
-                    .iter()
-                    .filter_map(|r| {
-                        // A user has `login`; a team has `slug` (and `name`).
-                        r.get("login")
-                            .or_else(|| r.get("slug"))
-                            .and_then(Value::as_str)
-                            .map(String::from)
-                    })
-                    .collect()
+        requested: list(v, "reviewRequests")
+            .iter()
+            .filter_map(|r| {
+                // GraphQL nests the reviewer; a user (or bot) has `login`, a
+                // team has `slug` (and `name`).
+                let r = r.get("requestedReviewer").unwrap_or(r);
+                r.get("login")
+                    .or_else(|| r.get("slug"))
+                    .and_then(Value::as_str)
+                    .map(String::from)
             })
-            .unwrap_or_default(),
-        assessment: v
-            .get("comments")
-            .and_then(Value::as_array)
-            .and_then(|comments| latest_assessment(comments)),
+            .collect(),
+        assessment: latest_assessment(list(v, "comments")),
+        ci: v
+            .pointer("/commits/nodes/0/commit/statusCheckRollup")
+            .and_then(ci_of_rollup),
+        cross_repository: v
+            .get("isCrossRepository")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        head_owner: v
+            .pointer("/headRepositoryOwner/login")
+            .and_then(Value::as_str)
+            .map(String::from),
     })
+}
+
+/// The head commit's checks folded by [`summarize`]. With more checks than
+/// the one page read, those read are not all of them: the rollup's own state
+/// (GitHub's verdict over every check) then decides whether CI passes.
+fn ci_of_rollup(rollup: &Value) -> Option<Ci> {
+    let contexts = rollup.pointer("/contexts/nodes")?.as_array()?;
+    let mut ci = summarize(&checks_of_rollup(contexts))?;
+    let more = rollup
+        .pointer("/contexts/pageInfo/hasNextPage")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if more {
+        match rollup.get("state").and_then(Value::as_str) {
+            Some("FAILURE" | "ERROR") => ci.state = CiState::Failing,
+            Some("PENDING" | "EXPECTED") if ci.state == CiState::Passing => {
+                ci.state = CiState::Pending;
+            }
+            _ => {}
+        }
+    }
+    Some(ci)
+}
+
+/// A check as `gh pr checks` reports it: `name`, `bucket` and `link`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Check {
+    pub name: String,
+    pub bucket: &'static str,
+    pub link: Option<String>,
+}
+
+/// The rollup's check runs and commit statuses as [`Check`]s, sorted into
+/// `gh`'s buckets, with only the latest run of each check kept (a re-run
+/// leaves the old one in the rollup). A check run is told apart by its name,
+/// workflow and event (one workflow on `push` and `pull_request` runs each job
+/// twice), a commit status by its context. A node that is neither (one GitHub
+/// could not resolve comes as `null`) is left out.
+fn checks_of_rollup(contexts: &[Value]) -> Vec<Check> {
+    let text = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).unwrap_or("").to_owned();
+    let mut latest: Vec<((String, String, String), String, Check)> = Vec::new();
+    for context in contexts {
+        let is_status = context.get("context").is_some();
+        if !is_status && context.get("name").and_then(Value::as_str).is_none() {
+            continue;
+        }
+        let run = context.pointer("/checkSuite/workflowRun");
+        let key = (
+            text(context, if is_status { "context" } else { "name" }),
+            run.and_then(|r| r.pointer("/workflow/name"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            run.map(|r| text(r, "event")).unwrap_or_default(),
+        );
+        let (name, bucket, link, at) = if is_status {
+            // A commit status: SUCCESS, FAILURE, ERROR, PENDING, EXPECTED.
+            let bucket = match text(context, "state").as_str() {
+                "SUCCESS" => "pass",
+                "FAILURE" | "ERROR" => "fail",
+                _ => "pending",
+            };
+            (
+                text(context, "context"),
+                bucket,
+                text(context, "targetUrl"),
+                text(context, "createdAt"),
+            )
+        } else {
+            let bucket = if text(context, "status") == "COMPLETED" {
+                match text(context, "conclusion").as_str() {
+                    "SUCCESS" | "NEUTRAL" => "pass",
+                    "SKIPPED" => "skipping",
+                    "CANCELLED" => "cancel",
+                    _ => "fail",
+                }
+            } else {
+                "pending"
+            };
+            (
+                text(context, "name"),
+                bucket,
+                text(context, "detailsUrl"),
+                text(context, "startedAt"),
+            )
+        };
+        let check = Check {
+            name: name.clone(),
+            bucket,
+            link: (!link.is_empty()).then_some(link),
+        };
+        match latest.iter_mut().find(|(k, _, _)| *k == key) {
+            Some(slot) if slot.1 <= at => (slot.1, slot.2) = (at, check),
+            Some(_) => {}
+            None => latest.push((key, at, check)),
+        }
+    }
+    latest.into_iter().map(|(_, _, check)| check).collect()
 }
 
 /// The newest comment whose body holds a risk and/or quality score table.
@@ -675,32 +544,45 @@ pub fn run_and_job_ids(link: &str) -> Option<(u64, u64)> {
     Some((run.parse().ok()?, job.parse().ok()?))
 }
 
-/// Fold `gh pr checks --json name,bucket,link` into one verdict. Buckets are
-/// `pass`, `fail`, `pending`, `skipping` and `cancel`; only `fail` is red and
-/// only `pending` is in flight. `None` when there are no checks at all.
+/// `gh pr checks --json name,bucket,link` as [`Check`]s, folded by
+/// [`summarize`]. `None` for no checks, or for text that is not that list.
 pub fn summarize_checks(json: &str) -> Option<Ci> {
     let v: Value = serde_json::from_str(json).ok()?;
-    let checks = v.as_array().filter(|a| !a.is_empty())?;
-    let mut failed = Vec::new();
-    let mut pending = 0;
-    for check in checks {
-        match check.get("bucket").and_then(Value::as_str) {
-            Some("fail") => failed.push(FailedJob {
-                name: check
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("?")
-                    .to_string(),
-                link: check
-                    .get("link")
-                    .and_then(Value::as_str)
-                    .filter(|l| !l.is_empty())
-                    .map(String::from),
-            }),
-            Some("pending") => pending += 1,
-            _ => {}
-        }
+    let checks: Vec<Check> = v
+        .as_array()?
+        .iter()
+        .map(|check| {
+            let text = |key| check.get(key).and_then(Value::as_str);
+            Check {
+                name: text("name").unwrap_or("?").to_owned(),
+                bucket: match text("bucket") {
+                    Some("fail") => "fail",
+                    Some("pending") => "pending",
+                    _ => "pass",
+                },
+                link: text("link").filter(|l| !l.is_empty()).map(String::from),
+            }
+        })
+        .collect();
+    summarize(&checks)
+}
+
+/// Fold checks into one verdict. Buckets are `pass`, `fail`, `pending`,
+/// `skipping` and `cancel`; only `fail` is red and only `pending` is in
+/// flight. `None` when there are no checks at all.
+pub fn summarize(checks: &[Check]) -> Option<Ci> {
+    if checks.is_empty() {
+        return None;
     }
+    let failed: Vec<FailedJob> = checks
+        .iter()
+        .filter(|c| c.bucket == "fail")
+        .map(|c| FailedJob {
+            name: c.name.clone(),
+            link: c.link.clone(),
+        })
+        .collect();
+    let pending = checks.iter().filter(|c| c.bucket == "pending").count();
     let state = if !failed.is_empty() {
         CiState::Failing
     } else if pending > 0 {
@@ -724,7 +606,72 @@ pub fn is_non_default_base(base: &str) -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn a_merged_pr_is_final_and_kept_while_a_miss_or_open_one_is_not() {
+    fn checks_are_kept_apart_by_workflow_and_event_and_only_reruns_collapse() {
+        let run = |name: &str, workflow: &str, event: &str, at: &str, conclusion: &str| {
+            serde_json::json!({"name": name, "status": "COMPLETED", "conclusion": conclusion,
+                "startedAt": at, "checkSuite": {"workflowRun": {"event": event, "workflow": {"name": workflow}}}})
+        };
+        let contexts = [
+            run("test", "ci", "push", "2026-01-01T10:00:00Z", "FAILURE"),
+            run(
+                "test",
+                "ci",
+                "pull_request",
+                "2026-01-01T10:00:05Z",
+                "SUCCESS",
+            ),
+            run("lint", "ci", "push", "2026-01-01T10:00:00Z", "FAILURE"),
+            run("lint", "ci", "push", "2026-01-01T10:05:00Z", "SUCCESS"),
+            serde_json::Value::Null,
+            serde_json::json!({}),
+        ];
+        let ci = super::summarize(&super::checks_of_rollup(&contexts)).unwrap();
+        assert_eq!(ci.state, super::CiState::Failing, "{ci:?}");
+        assert_eq!(
+            ci.failed.len(),
+            1,
+            "the push run of `test`; `lint` was re-run"
+        );
+        assert_eq!(ci.pending, 0, "a null node is not a check");
+    }
+
+    #[test]
+    fn past_one_page_of_checks_the_rollup_state_decides() {
+        let rollup = |state: &str, more: bool| {
+            serde_json::json!({"state": state, "contexts": {"pageInfo": {"hasNextPage": more},
+                "nodes": [{"name": "a", "status": "COMPLETED", "conclusion": "SUCCESS"}]}})
+        };
+        let state = |v| super::ci_of_rollup(&v).unwrap().state;
+        assert_eq!(state(rollup("FAILURE", true)), super::CiState::Failing);
+        assert_eq!(state(rollup("PENDING", true)), super::CiState::Pending);
+        assert_eq!(
+            state(rollup("FAILURE", false)),
+            super::CiState::Passing,
+            "all read"
+        );
+    }
+
+    #[test]
+    fn an_answer_is_old_once_well_past_when_it_was_due_again() {
+        let info = super::GhInfo {
+            fetched_ms: 1_000,
+            fresh_until_ms: 2_000,
+            ..super::GhInfo::default()
+        };
+        assert_eq!(info.old_for_ms(2_000 + super::OLD_AFTER_MS - 1), None);
+        assert_eq!(
+            info.old_for_ms(2_000 + super::OLD_AFTER_MS),
+            Some(1_000 + super::OLD_AFTER_MS)
+        );
+        assert_eq!(
+            super::GhInfo::default().old_for_ms(i64::MAX),
+            None,
+            "never stored"
+        );
+    }
+
+    #[test]
+    fn a_merged_or_closed_pr_is_final_and_a_miss_or_open_one_is_not() {
         let info = |pr: Option<i64>, state: Option<&str>| GhInfo {
             pr_number: pr,
             state: state.map(String::from),
@@ -738,124 +685,6 @@ mod tests {
             "an entry from before the state was kept"
         );
         assert!(!info(None, Some("MERGED")).is_final());
-        let dir = std::env::temp_dir().join(format!("sl-gh-final-{}", std::process::id()));
-        store(
-            &dir,
-            "/d",
-            "b",
-            &GhInfo {
-                fetched_ms: 0,
-                schema: SCHEMA,
-                ..info(Some(7), Some("MERGED"))
-            },
-        );
-        let kept = load_or_fetch(&dir, "/d", "b", 30 * 60 * 1000, |_| 1_000).expect("cached");
-        assert_eq!(
-            kept.pr_number,
-            Some(7),
-            "half an hour later it is still not asked again"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    fn entry(fetched_ms: i64, pr: Option<i64>, state: Option<&str>) -> GhInfo {
-        GhInfo {
-            fetched_ms,
-            schema: SCHEMA,
-            pr_number: pr,
-            state: state.map(String::from),
-            ..GhInfo::default()
-        }
-    }
-
-    #[test]
-    fn a_render_asks_again_after_thirty_seconds_unless_the_fetcher_vouched_for_longer() {
-        let open = entry(0, Some(1), Some("OPEN"));
-        assert!(!open.is_stale(29_999));
-        assert!(open.is_stale(30_000));
-        let vouched = GhInfo {
-            fresh_until_ms: 300_000,
-            ..open
-        };
-        assert!(
-            !vouched.is_stale(299_999),
-            "the tray polls every five minutes"
-        );
-        assert!(vouched.is_stale(300_000));
-        assert!(
-            GhInfo {
-                schema: SCHEMA - 1,
-                ..vouched
-            }
-            .is_stale(1),
-            "an entry from an older schema is always asked about"
-        );
-    }
-
-    #[test]
-    fn a_render_does_not_ask_again_about_a_merged_pr_within_the_hour() {
-        let merged = entry(0, Some(1), Some("MERGED"));
-        assert!(!merged.is_stale(FINAL_RECHECK_MS - 1));
-        assert!(merged.is_stale(FINAL_RECHECK_MS));
-    }
-
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("sl-gh-{name}-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        dir
-    }
-
-    #[test]
-    fn a_fetch_vouches_for_its_answer_and_gives_the_claim_back() {
-        let dir = scratch("vouch");
-        let got = load_or_fetch_with(
-            &dir,
-            "/d",
-            "b",
-            1_000,
-            |_| 60_000,
-            || entry(1_000, Some(2), Some("OPEN")),
-        )
-        .expect("fetched");
-        assert_eq!(got.fresh_until_ms, 61_000);
-        let stored = load_cached(&dir, "/d", "b").expect("stored");
-        assert_eq!(stored.fresh_until_ms, 61_000);
-        assert!(!stored.is_stale(60_999), "a render leaves it to the tray");
-        assert!(
-            !lock_path(&dir, &cache_key("/d", "b")).exists(),
-            "nothing is left claimed"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn while_another_process_is_fetching_the_old_entry_is_returned_and_gh_is_not_run() {
-        let dir = scratch("claimed");
-        store(&dir, "/d", "b", &entry(0, Some(2), Some("OPEN")));
-        assert!(
-            try_lock(&dir, &cache_key("/d", "b")),
-            "the other process's claim"
-        );
-        let asked = std::cell::Cell::new(false);
-        let got = load_or_fetch_with(
-            &dir,
-            "/d",
-            "b",
-            500_000,
-            |_| 60_000,
-            || {
-                asked.set(true);
-                entry(500_000, Some(2), Some("OPEN"))
-            },
-        )
-        .expect("the old entry");
-        assert!(!asked.get(), "another process is already asking");
-        assert_eq!(got.fetched_ms, 0);
-        assert!(
-            !try_lock(&dir, &cache_key("/d", "b")),
-            "its claim is untouched"
-        );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1166,81 +995,5 @@ mod tests {
         assert!(!worth_fetching("master"));
         assert!(!worth_fetching("@abc1234"));
         assert!(worth_fetching("feat/x"));
-    }
-
-    #[test]
-    fn entries_from_an_older_schema_deserialize_but_are_not_current() {
-        // What the previous build wrote: no reviews, no url, no schema.
-        let old: GhInfo =
-            serde_json::from_str(r#"{"pr_number":734,"base":"main","ci":null,"fetched_ms":1}"#)
-                .unwrap();
-        assert_eq!(old.schema, 0);
-        assert!(old.reviews.is_empty());
-        assert_ne!(old.schema, SCHEMA);
-        assert_eq!(fetch_stub_schema(), SCHEMA);
-    }
-
-    fn fetch_stub_schema() -> u32 {
-        GhInfo {
-            schema: SCHEMA,
-            ..GhInfo::default()
-        }
-        .schema
-    }
-
-    /// A stub `gh` that takes `delay` per call: `pr view` of the current
-    /// branch, of its base, and `pr checks`. Each call's start and end are
-    /// logged to `gh.log` beside it.
-    fn stub_gh(delay: &str, view: &str) -> (tempfile::TempDir, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
-        let dir_guard = tempfile::tempdir().unwrap();
-        let dir = dir_guard.path().to_path_buf();
-        let program = dir.join("gh");
-        let script = format!(
-            "#!/bin/sh\necho \"start $2 $3\" >> \"$0.log\"\nsleep {delay}\necho \"end $2 $3\" >> \"$0.log\"\ncase \"$2 $3\" in\n  \"view --json\") echo '{view}' ;;\n  \"view base\") echo '{{\"number\":6}}' ;;\n  \"checks --json\") echo '[{{\"name\":\"a\",\"bucket\":\"fail\"}}]' ;;\nesac\n"
-        );
-        fs::write(&program, script).unwrap();
-        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
-        (dir_guard, program)
-    }
-
-    #[test]
-    fn a_fetch_asks_for_the_checks_alongside_the_pr() {
-        let (dir, program) = stub_gh(
-            "0.3",
-            r#"{"number":7,"baseRefName":"base","isDraft":false}"#,
-        );
-        let info = fetch_with(&program, dir.path().to_str().unwrap(), 1);
-        assert_eq!(
-            (info.pr_number, info.base.as_deref(), info.base_pr),
-            (Some(7), Some("base"), Some(6))
-        );
-        assert_eq!(info.ci.map(|ci| ci.state), Some(CiState::Failing));
-        let log = fs::read_to_string(dir.path().join("gh.log")).unwrap();
-        let at = |line: &str| {
-            log.lines()
-                .position(|l| l == line)
-                .unwrap_or_else(|| panic!("{line:?} not in {log}"))
-        };
-        assert!(
-            at("start checks --json") < at("end view --json"),
-            "the checks did not wait for the PR:\n{log}"
-        );
-    }
-
-    #[test]
-    fn with_no_pr_the_checks_are_dropped() {
-        let (dir, program) = stub_gh("0", "");
-        let info = fetch_with(&program, dir.path().to_str().unwrap(), 1);
-        assert_eq!((info.pr_number, info.ci), (None, None));
-        assert_eq!(info.fetched_ms, 1);
-    }
-
-    #[test]
-    fn cache_key_separates_directories_and_branches() {
-        assert_eq!(cache_key("/a", "x"), cache_key("/a", "x"));
-        assert_ne!(cache_key("/a", "x"), cache_key("/b", "x"));
-        assert_ne!(cache_key("/a", "x"), cache_key("/a", "y"));
-        assert_ne!(cache_key("/ab", "c"), cache_key("/a", "bc"));
     }
 }

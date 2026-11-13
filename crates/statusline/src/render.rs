@@ -1,7 +1,7 @@
 use crate::ansi::{printable, visible_width};
 use crate::format::{
-    BRIGHT_GREEN, BRIGHT_RED, CYAN, GREEN, RED, WHITE, YELLOW, colored, dimmed, fmt_countdown,
-    fmt_elapsed, fmt_tokens, link, make_bar,
+    BRIGHT_GREEN, BRIGHT_RED, CYAN, GREEN, RED, WHITE, YELLOW, ago_short, colored, dimmed,
+    fmt_countdown, fmt_elapsed, fmt_tokens, link, make_bar,
 };
 use crate::gh::{CiState, GhInfo, MAX_FAILED_ROWS, Verdict, is_non_default_base};
 use crate::settings::effective_context_limit;
@@ -118,8 +118,10 @@ fn target(inputs: &RenderInputs) -> Option<&str> {
 /// ```
 ///
 /// the PR with its review state, the branch it is stacked on with that
-/// branch's own PR, then the PR's draft and CI state. Empty without a PR: the
-/// branch then sits on the main line.
+/// branch's own PR, then the PR's draft and CI state. An answer long past
+/// when it was due again (nothing is asking GitHub) has its CI dimmed and its
+/// age after it: `✓ CI passing | 2h old`. Empty without a PR: the branch then
+/// sits on the main line.
 pub fn pr_segments(inputs: &RenderInputs) -> Vec<String> {
     let (Some(gh), Some(branch)) = (&inputs.gh, inputs.branch.as_deref()) else {
         return Vec::new();
@@ -149,16 +151,27 @@ pub fn pr_segments(inputs: &RenderInputs) -> Vec<String> {
         None => {}
     }
 
+    let old_for = gh.old_for_ms(inputs.now_ms);
     if let Some(ci) = &gh.ci {
-        let text = match ci.state {
-            CiState::Passing => colored("✓ CI passing", GREEN),
-            CiState::Pending => colored(&format!("● CI running ({} pending)", ci.pending), YELLOW),
-            CiState::Failing => colored(&format!("✗ CI failed: {}", ci.failed.len()), BRIGHT_RED),
+        let (text, color) = match ci.state {
+            CiState::Passing => ("✓ CI passing".to_owned(), GREEN),
+            CiState::Pending => (format!("● CI running ({} pending)", ci.pending), YELLOW),
+            // A failure past the checks read has no name to count.
+            CiState::Failing if ci.failed.is_empty() => ("✗ CI failed".to_owned(), BRIGHT_RED),
+            CiState::Failing => (format!("✗ CI failed: {}", ci.failed.len()), BRIGHT_RED),
+        };
+        let text = if old_for.is_some() {
+            dimmed(&text)
+        } else {
+            colored(&text, color)
         };
         parts.push(match gh.url.as_deref() {
             Some(url) => link(&text, &format!("{url}/checks")),
             None => text,
         });
+    }
+    if let Some(age) = old_for {
+        parts.push(dimmed(&format!("{} old", ago_short(age))));
     }
     parts
 }

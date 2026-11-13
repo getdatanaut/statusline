@@ -22,9 +22,15 @@ fn main() {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("--gh-refresh") {
-        // Detached child spawned by a render; see `gh` module docs.
-        if let (Some(dir), Some(branch)) = (args.get(2), args.get(3)) {
-            gh::run_refresh(&gh::default_cache_dir(), dir, branch, now_ms());
+        // Detached child spawned by a render while no tray is asking GitHub;
+        // see `gh::sync`. Only this process uses `gh`'s token.
+        if let (Some(dir), Some(branch), Some(claim)) = (
+            args.get(2),
+            args.get(3),
+            args.get(4).and_then(|c| c.parse().ok()),
+        ) {
+            gh::api::use_token_source(gh_cli_token);
+            gh::run_refresh(dir, branch, gh::store::Claim(claim), now_ms());
         }
         return Ok(());
     }
@@ -75,9 +81,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let auto_compact_window = resolve_auto_compact_window(project_dir.as_deref(), &home);
 
     let gh = match (dir.as_deref(), branch.as_deref()) {
-        (Some(dir), Some(branch)) => {
-            gh::load_and_refresh(&gh::default_cache_dir(), dir, branch, now_ms)
-        }
+        (Some(dir), Some(branch)) => gh::load_and_refresh(dir, branch, now_ms),
         _ => None,
     };
 
@@ -121,6 +125,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         now_ms,
     );
     Ok(())
+}
+
+/// `gh auth token`, for when no tray is asking GitHub: the status line never
+/// reads the tray's own token, which is the tray's alone.
+///
+/// # Errors
+///
+/// `gh` not installed or not signed in: the status line then asks nothing,
+/// and notes why in the store.
+fn gh_cli_token() -> Result<Option<String>, String> {
+    let mut command = std::process::Command::new("gh");
+    command
+        .args(["auth", "token", "--hostname", "github.com"])
+        .env("PATH", statusline::process::tool_path());
+    match statusline::process::run(command, std::time::Duration::from_secs(5)) {
+        Ok(ran) if ran.success => Ok(Some(ran.stdout.trim().to_owned()).filter(|t| !t.is_empty())),
+        Ok(ran) => Err(format!("gh auth token: {}", ran.stderr.trim())),
+        Err(error) => Err(format!("cannot run gh: {error:?}")),
+    }
 }
 
 /// The value after `name`: `--hide cache,api` gives `cache,api`.

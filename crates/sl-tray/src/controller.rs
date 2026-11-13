@@ -1500,6 +1500,7 @@ impl BarController {
         *self.ivars().frozen.borrow_mut() = None;
         *self.ivars().frozen_closed.borrow_mut() = None;
         self.ivars().menu_open.set(true);
+        sessions::looked();
         self.repaint();
         self.retick();
     }

@@ -343,6 +343,34 @@ fn a_stacked_pr_is_one_row_its_state_then_the_branch_it_is_stacked_on() {
 }
 
 #[test]
+fn a_failure_past_the_checks_read_is_not_counted_as_none() {
+    let inputs = gh_inputs("main", Some(ci(statusline::gh::CiState::Failing, &[], 0)));
+    assert_eq!(
+        pr_rows(&base_payload(), &inputs),
+        vec!["feat/x (#730) | ✗ CI failed"]
+    );
+}
+
+#[test]
+fn an_answer_long_past_due_says_how_old_it_is() {
+    let mut inputs = gh_inputs("main", Some(ci(statusline::gh::CiState::Pending, &[], 3)));
+    let hour = 60 * 60_000;
+    let gh = inputs.gh.as_mut().unwrap();
+    gh.fetched_ms = inputs.now_ms - 2 * hour;
+    gh.fresh_until_ms = inputs.now_ms - 2 * hour + 10 * 60_000;
+    assert_eq!(
+        pr_rows(&base_payload(), &inputs),
+        vec!["feat/x (#730) | ● CI running (3 pending) | 2h old"]
+    );
+    inputs.gh.as_mut().unwrap().fresh_until_ms = inputs.now_ms;
+    assert_eq!(
+        pr_rows(&base_payload(), &inputs),
+        vec!["feat/x (#730) | ● CI running (3 pending)"],
+        "just due again: not old yet"
+    );
+}
+
+#[test]
 fn the_review_marker_is_the_stored_prs_own_verdict() {
     use statusline::gh::{Review, ReviewState};
     let marker = |decision: Option<&str>, reviews: &[ReviewState]| {
