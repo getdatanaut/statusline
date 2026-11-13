@@ -485,22 +485,21 @@ pub(crate) fn pill(text: impl Into<String>, tone: Tone) -> Pill {
 /// Where a PR's pills go, which says how much each says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PillsFor {
-    /// A compact card: `Ready`, and the CI with what its count is of.
+    /// A compact card: the CI with what its count is of.
     Card,
-    /// A session's submenu header: `Ready for review`, the CI as a count.
+    /// A session's submenu header: the CI as a count.
     Header,
 }
 
-/// A PR's draft state and verdict as pills, and its CI as one more: the same
+/// A PR's draft state (only when it is one: an open PR is otherwise ready,
+/// which says nothing) and verdict as pills, and its CI as one more: the same
 /// facts in both layouts, worded for `place`.
 pub(crate) fn pr_pills(info: &sl_core::gh::GhInfo, place: PillsFor) -> (Vec<Pill>, Option<Pill>) {
     let card = place == PillsFor::Card;
-    let ready = if card { "Ready" } else { "Ready for review" };
-    let mut pills = vec![if info.is_draft == Some(true) {
-        pill("Draft", Tone::Yellow)
-    } else {
-        pill(ready, Tone::Green)
-    }];
+    let mut pills = Vec::new();
+    if info.is_draft == Some(true) {
+        pills.push(pill("Draft", Tone::Yellow));
+    }
     if let Some((text, tone)) = sessions::verdict_text(info) {
         pills.push(pill(text, tone));
     }
@@ -1105,14 +1104,11 @@ mod tests {
         let failing = info(ci(sl_core::gh::CiState::Failing, 2, 0));
         assert_eq!(
             texts(&failing, PillsFor::Card),
-            (vec!["Ready".to_owned()], Some("CI ✗ 2 failed".to_owned()))
+            (vec![], Some("CI ✗ 2 failed".to_owned()))
         );
         assert_eq!(
             texts(&failing, PillsFor::Header),
-            (
-                vec!["Ready for review".to_owned()],
-                Some("CI ✗ 2".to_owned())
-            )
+            (vec![], Some("CI ✗ 2".to_owned()))
         );
         let pending = info(ci(sl_core::gh::CiState::Pending, 0, 3));
         assert_eq!(

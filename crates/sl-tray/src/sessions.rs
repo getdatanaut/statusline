@@ -2440,7 +2440,11 @@ mod tests {
                 .map(|p| p.text)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(header(&s), ["Ready for review", "Changes requested"]);
+        assert_eq!(
+            header(&s),
+            ["Changes requested"],
+            "not a draft: nothing to say"
+        );
         assert_eq!(
             plain(&base_segments(&info).unwrap()),
             "→ develop\n1adc44e1c5 · stacked on #729"
