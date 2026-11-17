@@ -128,6 +128,12 @@ impl StackView {
         self.entries.iter().find(|e| !e.state.is_final())
     }
 
+    /// Every PR merged or closed: nothing left to do, so the menu drops it.
+    /// (The notifier still sees it once, for the last merge.)
+    pub fn is_finished(&self) -> bool {
+        self.next_open().is_none()
+    }
+
     pub fn pr_url(&self, number: i64) -> Option<String> {
         self.repo_url
             .as_ref()
@@ -952,6 +958,32 @@ mod tests {
             chain.pr_url(20).as_deref(),
             Some("https://github.com/o/r/pull/20")
         );
+    }
+
+    #[test]
+    fn a_stack_is_finished_once_every_pr_is_merged_or_closed() {
+        let entry = |number, state| StackEntry {
+            number,
+            branch: None,
+            state,
+            session: EntrySession::None,
+            checked: true,
+        };
+        let stack = |entries| StackView {
+            number: None,
+            repo: None,
+            repo_url: None,
+            entries,
+        };
+        let done = stack(vec![
+            entry(1, EntryState::Merged),
+            entry(2, EntryState::Closed),
+        ]);
+        assert!(done.is_finished());
+        for open in [EntryState::Open, EntryState::Draft, EntryState::Unknown] {
+            let going = stack(vec![entry(1, EntryState::Merged), entry(2, open)]);
+            assert!(!going.is_finished(), "{open:?} is still to do");
+        }
     }
 
     #[test]

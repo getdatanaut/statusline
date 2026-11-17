@@ -1123,8 +1123,10 @@ fn publish(
     sticky: &Mutex<crate::sticky::Sticky>,
     open: &[OpenSession],
     gone: &[crate::sticky::Remembered],
-    stacks: Vec<crate::stacks::StackView>,
+    mut stacks: Vec<crate::stacks::StackView>,
 ) {
+    // A stack with everything merged is done; the watcher has already seen it.
+    stacks.retain(|stack| !stack.is_finished());
     let sticky = sticky
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
